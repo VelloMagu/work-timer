@@ -208,10 +208,20 @@ class Store:
         temporary.replace(self.path)
 
 
-def _request(method: str, path: str, token: str, body: dict[str, Any] | None = None, timeout: int = 30) -> Any:
+def _request(
+    method: str,
+    path: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+    timeout: int = 30,
+    return_response: bool = False,
+) -> Any:
     data = None if body is None else json.dumps(body).encode()
+    url = HA_API + path
+    if return_response:
+        url += "&return_response" if "?" in url else "?return_response"
     request = urllib.request.Request(
-        HA_API + path,
+        url,
         data=data,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method=method,
@@ -310,6 +320,7 @@ def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, s
             "start_date_time": start.strftime("%Y-%m-%d %H:%M:%S"),
             "end_date_time": end.strftime("%Y-%m-%d %H:%M:%S"),
         },
+        return_response=True,
     )
     found: list[dict[str, Any]] = []
     if isinstance(listed, dict):
@@ -449,7 +460,11 @@ class TimerApp:
 
     def snapshot(self) -> dict[str, Any]:
         with self.store.lock:
-            history = calendar_events(self.ha_token, self.calendar_entity, self.zone)
+            try:
+                history = calendar_events(self.ha_token, self.calendar_entity, self.zone)
+            except (OSError, RuntimeError, json.JSONDecodeError) as err:
+                print(f"calendar events were not loaded: {err}", flush=True)
+                history = []
             several = len(self.users) > 1
             now_epoch = int(self._now().timestamp())
             users = []
@@ -504,9 +519,19 @@ PAGE = """<!DOCTYPE html>
 <div id="users">Loading…</div>
 <script>
 async function load() {
-  const response = await fetch("api/view");
-  const data = await response.json();
   const root = document.getElementById("users");
+  let data;
+  try {
+    const response = await fetch("api/view");
+    data = await response.json();
+  } catch (err) {
+    root.textContent = "The timer could not be loaded.";
+    return;
+  }
+  if (!data || data.error) {
+    root.textContent = (data && data.error) || "The timer could not be loaded.";
+    return;
+  }
   root.innerHTML = "";
   for (const user of data.users || []) {
     const card = document.createElement("article");

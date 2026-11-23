@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5
+
+- The sidebar loads the timer when Home Assistant requires a response from the calendar event lookup.
+
 ## 0.1.4
 
 - A clear asks the panel to drop its on-screen lines and leaves the add-on lines and the calendar in place.
