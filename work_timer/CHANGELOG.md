@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.14
+
+- Add, remove, and assign timer users, including a default user for each Home Assistant person.
+- Expose each user to Home Assistant with start, pause, clear, reset, a play/pause/stopped status, and today's hours.
+
 ## 0.1.13
 
 - Add a Clear day button with inline confirmation to the selected calendar date panel to delete that day's calendar entries (and reset today's timer if today is cleared).

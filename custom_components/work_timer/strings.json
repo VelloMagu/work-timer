@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Work Timer",
+        "description": "Connect to the Work Timer add-on.",
+        "data": {
+          "url": "Add-on address",
+          "token": "API token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "The Work Timer add-on did not respond.",
+      "invalid_auth": "The API token was rejected."
+    },
+    "abort": {
+      "already_configured": "Work Timer is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Default user for each person",
+        "description": "The person sees this timer when they open the Work Timer sidebar.",
+        "data_description": {
+          "person": "Timer user"
+        }
+      }
+    }
+  }
+}

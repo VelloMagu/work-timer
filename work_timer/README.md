@@ -18,7 +18,9 @@ Home Assistant add-on. It keeps a work timer for each configured user and writes
 - `calendar_name`: name of the local calendar to create or reuse.
 - `token`: shared secret for the timer API.
 - `port`: HTTP port. Default `8097`.
-- `users`: one timer per name. A panel uses the matching name.
+- `users`: one timer per name. A panel uses the matching name. The sidebar can add or remove names after the add-on starts, and can set a default timer for each Home Assistant person.
+
+The custom integration in `custom_components/work_timer` adds one Home Assistant device per timer name. Each device has Start, Pause, Clear, and Reset buttons, a status of `play`, `pause`, or `stopped`, and today's hours. Copy that folder into Home Assistant `custom_components`, restart Home Assistant, and add the Work Timer integration with the add-on address and token.
 
 ## API
 

@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/data/work-timer.json"))
+DIRECTORY_PATH = Path(os.environ.get("DIRECTORY_PATH", "/data/work-timer-directory.json"))
 HA_API = os.environ.get("HA_API", "http://supervisor/core/api").rstrip("/")
 HA_WS = os.environ.get("HA_WS", "ws://supervisor/core/websocket")
 MAX_EVENTS = 6
@@ -58,7 +59,24 @@ def elapsed_label(user: dict[str, Any], now_epoch: int) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
+def live_seconds(user: dict[str, Any], now_epoch: int) -> int:
+    total = int(user.get("elapsed_seconds") or 0)
+    start = user.get("segment_start")
+    if user.get("running") and isinstance(start, (int, float)):
+        total += max(0, now_epoch - int(start))
+    return max(0, total)
+
+
+def timer_status(user: dict[str, Any], now_epoch: int) -> str:
+    if user.get("running"):
+        return "play"
+    if live_seconds(user, now_epoch) > 0:
+        return "pause"
+    return "stopped"
+
+
 def public_user(user: dict[str, Any], now_epoch: int) -> dict[str, Any]:
+    seconds = live_seconds(user, now_epoch)
     return {
         "running": bool(user.get("running")),
         "elapsed_seconds": int(user.get("elapsed_seconds") or 0),
@@ -68,6 +86,9 @@ def public_user(user: dict[str, Any], now_epoch: int) -> dict[str, Any]:
         "day": user.get("day") or "",
         "elapsed": elapsed_label(user, now_epoch),
         "display_cleared_at": int(user.get("display_cleared_at") or 0),
+        "status": timer_status(user, now_epoch),
+        "hours": round(seconds / 3600, 2),
+        "live_seconds": seconds,
     }
 
 
@@ -650,15 +671,74 @@ def daily_totals(events: list[dict[str, str]], zone: ZoneInfo, today_seconds: in
     return rows
 
 
+def load_directory(option_users: list[Any]) -> tuple[list[str], dict[str, str]]:
+    raw: dict[str, Any] = {}
+    if DIRECTORY_PATH.is_file():
+        try:
+            loaded = json.loads(DIRECTORY_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                raw = loaded
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+    names: list[str] = []
+    stored = raw.get("users") if isinstance(raw.get("users"), list) else []
+    for source in (stored, option_users):
+        for item in source:
+            name = str(item or "").strip()
+            if name and name not in names:
+                names.append(name)
+    if not names:
+        names = ["panel"]
+    people: dict[str, str] = {}
+    stored_people = raw.get("people") if isinstance(raw.get("people"), dict) else {}
+    for person, user in stored_people.items():
+        person_id = str(person or "").strip()
+        user_name = str(user or "").strip()
+        if person_id.startswith("person.") and user_name in names:
+            people[person_id] = user_name
+    return names, people
+
+
+def save_directory(names: list[str], people: dict[str, str]) -> None:
+    DIRECTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DIRECTORY_PATH.write_text(
+        json.dumps({"users": names, "people": people}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def ha_persons(token: str) -> list[dict[str, str]]:
+    states = _request("GET", "/states", token)
+    people = []
+    if not isinstance(states, list):
+        return people
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        entity = str(state.get("entity_id") or "")
+        if not entity.startswith("person."):
+            continue
+        attrs = state.get("attributes") if isinstance(state.get("attributes"), dict) else {}
+        people.append(
+            {
+                "entity_id": entity,
+                "name": str(attrs.get("friendly_name") or entity),
+                "user_id": str(attrs.get("user_id") or ""),
+            }
+        )
+    people.sort(key=lambda item: item["name"].casefold())
+    return people
+
+
 class TimerApp:
     def __init__(self, options: dict[str, Any], calendar_entity: str, zone: ZoneInfo, ha_token: str) -> None:
         self.options = options
         self.calendar_entity = calendar_entity
         self.zone = zone
         self.ha_token = ha_token
-        self.users = {str(name).strip() for name in options.get("users") or [] if str(name).strip()}
-        if not self.users:
-            self.users = {"panel"}
+        self.user_names, self.people = load_directory(list(options.get("users") or []))
+        self.users = set(self.user_names)
+        save_directory(self.user_names, self.people)
         self.store = Store(STATE_PATH)
         self.token = str(options.get("token") or "").strip()
 
@@ -815,6 +895,87 @@ class TimerApp:
                 user["updated_at"] = int(now.timestamp())
                 self.store.save()
             return {"deleted": deleted, "date": date_iso}
+
+    def _remember(self) -> None:
+        self.users = set(self.user_names)
+        save_directory(self.user_names, self.people)
+
+    def _directory_locked(self) -> dict[str, Any]:
+        now_epoch = int(self._now().timestamp())
+        rows = []
+        for name in self.user_names:
+            user = self._user(name)
+            view = public_user(user, now_epoch)
+            rows.append(
+                {
+                    "name": name,
+                    "status": view["status"],
+                    "hours": view["hours"],
+                    "running": view["running"],
+                    "elapsed": view["elapsed"],
+                    "live_seconds": view["live_seconds"],
+                }
+            )
+        self.store.save()
+        return {"users": rows, "people": dict(self.people)}
+
+    def directory(self) -> dict[str, Any]:
+        with self.store.lock:
+            return self._directory_locked()
+
+    def add_user(self, name: str) -> dict[str, Any]:
+        cleaned = " ".join(name.split())
+        if not cleaned or len(cleaned) > 40:
+            raise ValueError("enter a user name")
+        with self.store.lock:
+            if cleaned not in self.user_names:
+                self.user_names.append(cleaned)
+                self._user(cleaned)
+                self._remember()
+            return self._directory_locked()
+
+    def remove_user(self, name: str) -> dict[str, Any]:
+        with self.store.lock:
+            if name not in self.user_names:
+                raise KeyError(name)
+            if len(self.user_names) == 1:
+                raise ValueError("keep at least one user")
+            self.user_names.remove(name)
+            self.store.users.pop(name, None)
+            self.people = {person: user for person, user in self.people.items() if user != name}
+            self._remember()
+            return self._directory_locked()
+
+    def set_person(self, person: str, user: str) -> dict[str, Any]:
+        person_id = person.strip()
+        if not person_id.startswith("person."):
+            raise ValueError("choose a person")
+        with self.store.lock:
+            if user and user not in self.user_names:
+                raise KeyError(user)
+            if user:
+                self.people[person_id] = user
+            else:
+                self.people.pop(person_id, None)
+            self._remember()
+            return self._directory_locked()
+
+    def session_for(self, user_id: str) -> dict[str, Any]:
+        persons = ha_persons(self.ha_token)
+        linked = [item["entity_id"] for item in persons if user_id and item["user_id"] == user_id]
+        default_user = ""
+        for person_id in linked:
+            if person_id in self.people:
+                default_user = self.people[person_id]
+                break
+        return {
+            "user_id": user_id,
+            "persons": linked,
+            "default_user": default_user,
+            "users": list(self.user_names),
+            "people": dict(self.people),
+            "ha_people": persons,
+        }
 
 
 PAGE = """<!DOCTYPE html>
@@ -1358,6 +1519,36 @@ PAGE = """<!DOCTYPE html>
     padding: 5px 11px;
     font-size: 0.8rem;
   }
+  .directory {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 18px;
+  }
+  .directory h2 { margin: 0 0 8px; font-size: 1rem; }
+  .user-form { display: flex; gap: 8px; }
+  .user-form input {
+    flex: 1;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: var(--surface);
+    color: inherit;
+  }
+  .user-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .user-row, .person-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .person-row select {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    background: var(--surface);
+    color: inherit;
+  }
 </style>
 </head>
 <body>
@@ -1373,11 +1564,26 @@ PAGE = """<!DOCTYPE html>
     </div>
   </header>
   <main id="users" class="status-banner">Loading…</main>
+  <section id="directory" class="directory">
+    <div>
+      <h2>Users</h2>
+      <form id="addUser" class="user-form">
+        <input id="userName" type="text" maxlength="40" placeholder="Name" autocomplete="off">
+        <button type="submit">Add</button>
+      </form>
+      <div id="userList" class="user-list"></div>
+    </div>
+    <div>
+      <h2>Default person</h2>
+      <div id="peopleList" class="user-list"></div>
+    </div>
+  </section>
 </div>
 <script>
 let currentUsers = [];
 let serverOffsetSec = 0;
 let serverToday = "";
+let session = {default_user: "", users: [], people: {}, ha_people: []};
 const calState = {};
 const pendingReset = {};
 const pendingClearDay = {};
@@ -2053,9 +2259,86 @@ async function load() {
     serverToday = data.today;
   }
   currentUsers = data.users || [];
+  try {
+    const sessionResponse = await fetch("api/session");
+    if (sessionResponse.ok) session = await sessionResponse.json();
+  } catch (err) {}
+  if (session.default_user) {
+    currentUsers.sort((a, b) => (a.name === session.default_user ? -1 : b.name === session.default_user ? 1 : 0));
+  }
   render(currentUsers);
+  renderDirectory();
   synced.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+
+function renderDirectory() {
+  const list = document.getElementById("userList");
+  list.innerHTML = "";
+  for (const name of session.users || []) {
+    const row = document.createElement("div");
+    row.className = "user-row";
+    const label = document.createElement("span");
+    label.textContent = name;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost";
+    button.textContent = "Remove";
+    button.addEventListener("click", async () => {
+      await fetch("v1/users", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name: name, remove: true})
+      });
+      load();
+    });
+    row.append(label, button);
+    list.appendChild(row);
+  }
+  const people = document.getElementById("peopleList");
+  people.innerHTML = "";
+  for (const person of session.ha_people || []) {
+    const row = document.createElement("label");
+    row.className = "person-row";
+    const label = document.createElement("span");
+    label.textContent = person.name;
+    const select = document.createElement("select");
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "No default";
+    select.appendChild(none);
+    for (const name of session.users || []) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      if ((session.people || {})[person.entity_id] === name) option.selected = true;
+      select.appendChild(option);
+    }
+    select.addEventListener("change", async () => {
+      await fetch("v1/people", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({person: person.entity_id, user: select.value})
+      });
+      load();
+    });
+    row.append(label, select);
+    people.appendChild(row);
+  }
+}
+
+document.getElementById("addUser").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.getElementById("userName");
+  const name = input.value.trim();
+  if (!name) return;
+  await fetch("v1/users", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({name: name})
+  });
+  input.value = "";
+  load();
+});
 
 document.getElementById("refreshBtn").addEventListener("click", () => {
   for (const key of Object.keys(calState)) {
@@ -2162,6 +2445,34 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
                 except (OSError, RuntimeError) as err:
                     self._send(502, {"error": str(err)})
                 return
+            if path == "/api/session":
+                if not self._ingress():
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                user_id = self.headers.get("X-Remote-User-Id", "")
+                try:
+                    self._send(200, app.session_for(user_id))
+                except (OSError, RuntimeError) as err:
+                    self._send(502, {"error": str(err)})
+                return
+            if path == "/v1/users":
+                if not self._authorized():
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    self._send(200, app.directory())
+                except (OSError, RuntimeError) as err:
+                    self._send(502, {"error": str(err)})
+                return
+            if path == "/v1/people":
+                if not self._authorized():
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    self._send(200, app.session_for(""))
+                except (OSError, RuntimeError) as err:
+                    self._send(502, {"error": str(err)})
+                return
             if path != "/v1/timer":
                 self._send(404, {"error": "not found"})
                 return
@@ -2179,6 +2490,45 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/")
+            if path == "/v1/users":
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                payload = self._read_json()
+                if payload is None:
+                    self._send(400, {"error": "invalid json"})
+                    return
+                try:
+                    if payload.get("remove"):
+                        result = app.remove_user(str(payload.get("name") or "").strip())
+                    else:
+                        result = app.add_user(str(payload.get("name") or ""))
+                except KeyError:
+                    self._send(404, {"error": "no user"})
+                    return
+                except ValueError as err:
+                    self._send(400, {"error": str(err)})
+                    return
+                self._send(200, result)
+                return
+            if path == "/v1/people":
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                payload = self._read_json()
+                if payload is None:
+                    self._send(400, {"error": "invalid json"})
+                    return
+                try:
+                    result = app.set_person(str(payload.get("person") or ""), str(payload.get("user") or "").strip())
+                except KeyError:
+                    self._send(404, {"error": "no user"})
+                    return
+                except ValueError as err:
+                    self._send(400, {"error": str(err)})
+                    return
+                self._send(200, result)
+                return
             if path == "/api/clear-day":
                 if not (self._ingress() or self._authorized()):
                     self._send(401, {"error": "unauthorized"})

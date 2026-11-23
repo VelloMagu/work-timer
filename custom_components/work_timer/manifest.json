@@ -1,0 +1,10 @@
+{
+  "domain": "work_timer",
+  "name": "Work Timer",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/VelloMagu/work-timer",
+  "iot_class": "local_polling",
+  "integration_type": "device",
+  "version": "0.1.14"
+}
