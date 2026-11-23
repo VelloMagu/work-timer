@@ -1125,6 +1125,32 @@ PAGE = """<!DOCTYPE html>
     border: 1px solid var(--border);
     color: var(--text-muted);
   }
+  .inline-notice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px 14px;
+    padding: 11px 14px;
+    border-radius: 11px;
+    font-size: 0.84rem;
+    background: var(--amber-soft);
+    border: 1px solid rgba(217, 119, 6, 0.3);
+    color: var(--text);
+  }
+  .inline-notice.error {
+    background: var(--red-soft);
+    border-color: rgba(220, 38, 38, 0.3);
+  }
+  .inline-notice-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .inline-notice-actions button {
+    padding: 5px 11px;
+    font-size: 0.8rem;
+  }
 </style>
 </head>
 <body>
@@ -1146,6 +1172,8 @@ let currentUsers = [];
 let serverOffsetSec = 0;
 let serverToday = "";
 const calState = {};
+const pendingReset = {};
+const cardNotices = {};
 
 function fmtHMS(totalSec) {
   const s = Math.max(0, Math.floor(totalSec));
@@ -1226,16 +1254,23 @@ function getCalState(userName) {
 }
 
 async function sendCommand(userName, command, button) {
-  if (command === "reset" && !window.confirm("Reset today's timer for " + userName + " to 00:00? Completed calendar entries will be kept.")) {
-    return;
-  }
   if (button) button.disabled = true;
+  delete cardNotices[userName];
+  if (command === "reset") {
+    pendingReset[userName] = false;
+  }
   try {
-    await fetch("api/command", {
+    const resp = await fetch("api/command", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({user: userName, command})
     });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      cardNotices[userName] = (errData && errData.error) || "Command failed.";
+    }
+  } catch (err) {
+    cardNotices[userName] = "Could not reach the add-on.";
   } finally {
     const st = getCalState(userName);
     st.loadedKey = "";
@@ -1613,11 +1648,56 @@ function render(users) {
     resetBtn.className = "danger";
     resetBtn.textContent = "Reset";
     resetBtn.disabled = !user.running && secNow <= 0;
-    resetBtn.addEventListener("click", () => sendCommand(user.name, "reset", resetBtn));
+    resetBtn.addEventListener("click", () => {
+      pendingReset[user.name] = true;
+      render(currentUsers);
+    });
     actions.append(toggleBtn, resetBtn);
     hero.append(timerBox, actions);
 
     card.append(head, hero);
+
+    if (pendingReset[user.name]) {
+      const warn = document.createElement("div");
+      warn.className = "inline-notice";
+      const msg = document.createElement("span");
+      msg.textContent = "Reset today's timer to 00:00? Completed calendar entries will be kept.";
+      const warnBtns = document.createElement("div");
+      warnBtns.className = "inline-notice-actions";
+      const confirmBtn = document.createElement("button");
+      confirmBtn.type = "button";
+      confirmBtn.className = "danger";
+      confirmBtn.textContent = "Confirm reset";
+      confirmBtn.addEventListener("click", () => sendCommand(user.name, "reset", confirmBtn));
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "ghost";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", () => {
+        pendingReset[user.name] = false;
+        render(currentUsers);
+      });
+      warnBtns.append(confirmBtn, cancelBtn);
+      warn.append(msg, warnBtns);
+      card.appendChild(warn);
+    }
+
+    if (cardNotices[user.name]) {
+      const errBar = document.createElement("div");
+      errBar.className = "inline-notice error";
+      const errMsg = document.createElement("span");
+      errMsg.textContent = cardNotices[user.name];
+      const dismissBtn = document.createElement("button");
+      dismissBtn.type = "button";
+      dismissBtn.className = "ghost";
+      dismissBtn.textContent = "Dismiss";
+      dismissBtn.addEventListener("click", () => {
+        delete cardNotices[user.name];
+        render(currentUsers);
+      });
+      errBar.append(errMsg, dismissBtn);
+      card.appendChild(errBar);
+    }
 
     // Last 5 days section: except today, show only days with timestamp data.
     // If no days in the last 5 have any timestamp data, hide the section completely.

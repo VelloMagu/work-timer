@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.12
+
+- Replace browser confirmation dialog with inline warning and error banners inside the card.
+
 ## 0.1.11
 
 - In the Last 5 days section, show only past days that have timestamp data (plus today when any day has data), and hide the section completely when there is no data.
