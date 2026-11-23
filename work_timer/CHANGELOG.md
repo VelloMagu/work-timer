@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+- Publish port 8097 so the panel can start, pause, and reset the add-on timer.
+
 ## 0.1.6
 
 - The sidebar can start, pause, and reset the timer, clear the panel screen, and clear the add-on lines.
