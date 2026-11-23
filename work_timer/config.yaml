@@ -1,5 +1,5 @@
 name: Work Timer
-version: 0.1.0
+version: 0.1.1
 slug: work_timer
 description: Keeps a work timer for one or more users and writes completed intervals to a Home Assistant calendar.
 url: https://github.com/VelloMagu/work-timer
@@ -10,6 +10,7 @@ startup: services
 boot: auto
 init: false
 homeassistant_api: true
+hassio_api: true
 options:
   calendar_name: ""
   token: ""
