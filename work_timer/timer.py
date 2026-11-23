@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import socket
+import ssl
+import struct
 import threading
 import urllib.error
 import urllib.request
@@ -12,11 +16,12 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/data/work-timer.json"))
 HA_API = os.environ.get("HA_API", "http://supervisor/core/api").rstrip("/")
+HA_WS = os.environ.get("HA_WS", "ws://supervisor/core/websocket")
 MAX_EVENTS = 6
 
 
@@ -362,6 +367,178 @@ def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, s
     return calendar_events_range(token, entity, zone, start, end)
 
 
+def _ws_recv_exact(sock: socket.socket, count: int, buf: bytearray) -> bytes:
+    while len(buf) < count:
+        chunk = sock.recv(max(4096, count - len(buf)))
+        if not chunk:
+            raise RuntimeError("Home Assistant WebSocket closed unexpectedly")
+        buf.extend(chunk)
+    out = bytes(buf[:count])
+    del buf[:count]
+    return out
+
+
+def _ws_send_frame(sock: socket.socket, opcode: int, payload: bytes) -> None:
+    mask = os.urandom(4)
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", length))
+    header.extend(mask)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(bytes(header) + masked)
+
+
+def _ws_recv_json(sock: socket.socket, buf: bytearray) -> dict[str, Any]:
+    while True:
+        first, second = _ws_recv_exact(sock, 2, buf)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", _ws_recv_exact(sock, 2, buf))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", _ws_recv_exact(sock, 8, buf))[0]
+        mask = _ws_recv_exact(sock, 4, buf) if masked else b""
+        payload = _ws_recv_exact(sock, length, buf) if length else b""
+        if masked:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if opcode == 0x9:  # ping
+            _ws_send_frame(sock, 0xA, payload)
+            continue
+        if opcode == 0x8:  # close
+            raise RuntimeError("Home Assistant WebSocket closed")
+        if opcode in (0x1, 0x2):
+            parsed = json.loads(payload.decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+
+
+def _ws_delete_calendar_events(token: str, entity: str, targets: list[dict[str, str]]) -> int:
+    if not targets:
+        return 0
+    parsed = urlparse(HA_WS)
+    scheme = parsed.scheme or "ws"
+    host = parsed.hostname or "supervisor"
+    port = parsed.port or (443 if scheme == "wss" else 80)
+    ws_path = parsed.path or "/core/websocket"
+    if parsed.query:
+        ws_path += "?" + parsed.query
+    raw_sock = socket.create_connection((host, port), timeout=15)
+    sock: socket.socket = (
+        ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host)
+        if scheme == "wss"
+        else raw_sock
+    )
+    try:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        host_header = f"{host}:{port}" if parsed.port else host
+        req = (
+            f"GET {ws_path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(req.encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(1024)
+            if not chunk:
+                raise RuntimeError("WebSocket handshake failed")
+            head += chunk
+            if len(head) > 16384:
+                raise RuntimeError("WebSocket handshake header too large")
+        header_part, leftover = head.split(b"\r\n\r\n", 1)
+        status_line = header_part.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        if " 101 " not in status_line:
+            raise RuntimeError(f"WebSocket handshake rejected: {status_line}")
+        ws_buf = bytearray(leftover)
+
+        greeting = _ws_recv_json(sock, ws_buf)
+        if greeting.get("type") == "auth_required":
+            _ws_send_frame(sock, 0x1, json.dumps({"type": "auth", "access_token": token}).encode("utf-8"))
+            auth = _ws_recv_json(sock, ws_buf)
+            if auth.get("type") != "auth_ok":
+                raise RuntimeError(f"WebSocket auth failed: {auth.get('message') or auth.get('type')}")
+
+        deleted = 0
+        for idx, item in enumerate(targets, start=1):
+            msg: dict[str, Any] = {
+                "id": idx,
+                "type": "calendar/event/delete",
+                "entity_id": entity,
+                "uid": item["uid"],
+            }
+            if item.get("recurrence_id"):
+                msg["recurrence_id"] = item["recurrence_id"]
+            _ws_send_frame(sock, 0x1, json.dumps(msg).encode("utf-8"))
+            while True:
+                reply = _ws_recv_json(sock, ws_buf)
+                if reply.get("id") == idx:
+                    if not reply.get("success"):
+                        err = reply.get("error")
+                        detail = err.get("message") if isinstance(err, dict) else str(err)
+                        raise RuntimeError(f"Could not delete event {item['uid']}: {detail}")
+                    deleted += 1
+                    break
+        return deleted
+    finally:
+        try:
+            _ws_send_frame(sock, 0x8, b"")
+        except OSError:
+            pass
+        sock.close()
+
+
+def _event_start_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("dateTime") or value.get("date") or "")
+    return str(value or "")
+
+
+def delete_day_events(
+    token: str,
+    entity: str,
+    zone: ZoneInfo,
+    date_iso: str,
+    user_name: str,
+    several: bool,
+) -> int:
+    day_dt = datetime.strptime(date_iso, "%Y-%m-%d").replace(tzinfo=zone)
+    start_dt = day_dt
+    end_dt = day_dt + timedelta(days=1)
+    query = urlencode({"start": start_dt.isoformat(), "end": end_dt.isoformat()})
+    raw = _request("GET", f"/calendars/{entity}?{query}", token)
+    targets: list[dict[str, str]] = []
+    if isinstance(raw, list):
+        for event in raw:
+            if not isinstance(event, dict):
+                continue
+            uid = str(event.get("uid") or "").strip()
+            if not uid:
+                continue
+            if several and str(event.get("summary") or "") != user_name:
+                continue
+            start_moment = _moment(_event_start_text(event.get("start")), zone)
+            if start_moment is None or start_moment.date().isoformat() != date_iso:
+                continue
+            targets.append(
+                {
+                    "uid": uid,
+                    "recurrence_id": str(event.get("recurrence_id") or "").strip(),
+                }
+            )
+    return _ws_delete_calendar_events(token, entity, targets)
+
+
 def build_timetables(
     events: list[dict[str, str]],
     zone: ZoneInfo,
@@ -608,6 +785,36 @@ class TimerApp:
                 "days": timetables,
                 "server_now": now_epoch,
             }
+
+    def clear_day(self, name: str, date_iso: str) -> dict[str, Any]:
+        if name not in self.users:
+            raise KeyError(name)
+        try:
+            datetime.strptime(date_iso, "%Y-%m-%d")
+        except ValueError as err:
+            raise ValueError("invalid date") from err
+        several = len(self.users) > 1
+        with self.store.lock:
+            deleted = delete_day_events(
+                self.ha_token,
+                self.calendar_entity,
+                self.zone,
+                date_iso,
+                name,
+                several,
+            )
+            now = self._now()
+            today = now.strftime("%Y-%m-%d")
+            if date_iso == today:
+                user = self._user(name)
+                user["running"] = False
+                user["segment_start"] = None
+                user["elapsed_seconds"] = 0
+                user["events"] = []
+                user["seen_intervals"] = []
+                user["updated_at"] = int(now.timestamp())
+                self.store.save()
+            return {"deleted": deleted, "date": date_iso}
 
 
 PAGE = """<!DOCTYPE html>
@@ -1173,6 +1380,7 @@ let serverOffsetSec = 0;
 let serverToday = "";
 const calState = {};
 const pendingReset = {};
+const pendingClearDay = {};
 const cardNotices = {};
 
 function fmtHMS(totalSec) {
@@ -1268,6 +1476,29 @@ async function sendCommand(userName, command, button) {
     if (!resp.ok) {
       const errData = await resp.json().catch(() => ({}));
       cardNotices[userName] = (errData && errData.error) || "Command failed.";
+    }
+  } catch (err) {
+    cardNotices[userName] = "Could not reach the add-on.";
+  } finally {
+    const st = getCalState(userName);
+    st.loadedKey = "";
+    await load();
+  }
+}
+
+async function clearDayData(userName, dateIso, button) {
+  if (button) button.disabled = true;
+  delete cardNotices[userName];
+  delete pendingClearDay[userName];
+  try {
+    const resp = await fetch("api/clear-day", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({user: userName, date: dateIso})
+    });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      cardNotices[userName] = (errData && errData.error) || "Could not clear day data.";
     }
   } catch (err) {
     cardNotices[userName] = "Could not reach the add-on.";
@@ -1399,15 +1630,65 @@ function buildDayPanel(dayData, user, options) {
   footLbl.className = "foot-label";
   footLbl.textContent = "Total";
   const totalSec = effectiveDayTotalSeconds(dayData, user);
+  const footRight = document.createElement("div");
+  footRight.className = "actions";
   const footVal = document.createElement("span");
   footVal.className = "foot-total" + (totalSec <= 0 ? " zero" : "");
   footVal.textContent = fmtHoursMins(totalSec);
   if (isToday && user) {
     footVal.dataset.dayTotal = user.name;
   }
-  foot.append(footLbl, footVal);
+  footRight.appendChild(footVal);
 
-  panel.append(head, body, foot);
+  const canClear = Boolean(
+    opts.allowClear &&
+    user &&
+    (intervals.length > 0 || (isToday && (user.running || Number(user.elapsed_seconds || 0) > 0)))
+  );
+  if (canClear && pendingClearDay[user.name] !== iso) {
+    const clearDayBtn = document.createElement("button");
+    clearDayBtn.type = "button";
+    clearDayBtn.className = "danger";
+    clearDayBtn.style.padding = "4px 10px";
+    clearDayBtn.style.fontSize = "0.78rem";
+    clearDayBtn.textContent = "Clear day";
+    clearDayBtn.addEventListener("click", () => {
+      pendingClearDay[user.name] = iso;
+      renderCalendarArea(user.name);
+    });
+    footRight.appendChild(clearDayBtn);
+  }
+  foot.append(footLbl, footRight);
+
+  panel.append(head, body);
+
+  if (opts.allowClear && user && pendingClearDay[user.name] === iso) {
+    const confirmBar = document.createElement("div");
+    confirmBar.className = "inline-notice";
+    confirmBar.style.margin = "0 10px 10px";
+    const msg = document.createElement("span");
+    msg.textContent = "Clear all data for " + iso + "? Calendar entries for this day will be deleted.";
+    const btns = document.createElement("div");
+    btns.className = "inline-notice-actions";
+    const yesBtn = document.createElement("button");
+    yesBtn.type = "button";
+    yesBtn.className = "danger";
+    yesBtn.textContent = "Confirm clear";
+    yesBtn.addEventListener("click", () => clearDayData(user.name, iso, yesBtn));
+    const noBtn = document.createElement("button");
+    noBtn.type = "button";
+    noBtn.className = "ghost";
+    noBtn.textContent = "Cancel";
+    noBtn.addEventListener("click", () => {
+      delete pendingClearDay[user.name];
+      renderCalendarArea(user.name);
+    });
+    btns.append(yesBtn, noBtn);
+    confirmBar.append(msg, btns);
+    panel.appendChild(confirmBar);
+  }
+
+  panel.appendChild(foot);
   return panel;
 }
 
@@ -1538,6 +1819,7 @@ function renderCalendarArea(userName) {
       + (hasWork ? " has-work" : "");
     cell.addEventListener("click", () => {
       st.selectedDate = iso;
+      delete pendingClearDay[userName];
       renderCalendarArea(userName);
     });
 
@@ -1571,7 +1853,7 @@ function renderCalendarArea(userName) {
   if (!selectedDay) {
     selectedDay = { date: selectedIso, intervals: [], total_seconds: 0 };
   }
-  detailWrap.appendChild(buildDayPanel(selectedDay, user, { fullDate: true, showDuration: true }));
+  detailWrap.appendChild(buildDayPanel(selectedDay, user, { fullDate: true, showDuration: true, allowClear: true }));
 
   container.append(calPanel, detailWrap);
 }
@@ -1612,13 +1894,7 @@ function render(users) {
     clearPanelBtn.className = "ghost";
     clearPanelBtn.textContent = "Clear panel screen";
     clearPanelBtn.addEventListener("click", () => sendCommand(user.name, "clear", clearPanelBtn));
-
-    const clearAddonBtn = document.createElement("button");
-    clearAddonBtn.type = "button";
-    clearAddonBtn.className = "ghost";
-    clearAddonBtn.textContent = "Clear add-on timestamps";
-    clearAddonBtn.addEventListener("click", () => sendCommand(user.name, "clear_addon", clearAddonBtn));
-    headTools.append(clearPanelBtn, clearAddonBtn);
+    headTools.append(clearPanelBtn);
     head.append(headLeft, headTools);
 
     // Live timer + controls
@@ -1903,6 +2179,29 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/")
+            if path == "/api/clear-day":
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                payload = self._read_json()
+                if payload is None:
+                    self._send(400, {"error": "invalid json"})
+                    return
+                name = str(payload.get("user") or "panel")
+                date_iso = str(payload.get("date") or "").strip()
+                try:
+                    result = app.clear_day(name, date_iso)
+                except KeyError:
+                    self._send(404, {"error": f"no user {name}"})
+                    return
+                except ValueError as err:
+                    self._send(400, {"error": str(err)})
+                    return
+                except (OSError, RuntimeError) as err:
+                    self._send(502, {"error": str(err)})
+                    return
+                self._send(200, result)
+                return
             if path in ("/api/clear-addon", "/api/command"):
                 if not (self._ingress() or self._authorized()):
                     self._send(401, {"error": "unauthorized"})

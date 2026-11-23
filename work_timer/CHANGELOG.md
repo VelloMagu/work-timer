@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.13
+
+- Add a Clear day button with inline confirmation to the selected calendar date panel to delete that day's calendar entries (and reset today's timer if today is cleared).
+- Remove the Clear add-on timestamps button from the header.
+
 ## 0.1.12
 
 - Replace browser confirmation dialog with inline warning and error banners inside the card.
