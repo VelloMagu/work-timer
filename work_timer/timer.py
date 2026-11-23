@@ -162,14 +162,25 @@ def apply_command(user: dict[str, Any], command: str, now_epoch: int, when: str)
 
 
 def merge_users(server: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
-    """Keep one open segment. A restart is not a pause. The newer command snapshot wins otherwise."""
+    """Keep a running timer. A sync from a stopped side is not a pause."""
     server_at = int(server.get("updated_at") or 0)
     client_at = int(client.get("updated_at") or 0)
+    server_running = bool(server.get("running"))
+    client_running = bool(client.get("running"))
+    if server_running != client_running:
+        result = deepcopy(server if server_running else client)
+        result["running"] = True
+        result["events"] = list(server.get("events") or [])
+        result["display_cleared_at"] = int(server.get("display_cleared_at") or 0)
+        if server_running:
+            result["segment_start"] = server.get("segment_start")
+            result["elapsed_seconds"] = int(server.get("elapsed_seconds") or 0)
+        return result
     newer = client if client_at > server_at else server
     result = deepcopy(newer)
     result["events"] = list(server.get("events") or [])
     result["display_cleared_at"] = int(server.get("display_cleared_at") or 0)
-    both_running = bool(server.get("running")) and bool(client.get("running"))
+    both_running = server_running and client_running
     if not both_running:
         return result
     starts = [

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.8
+
+- A timer started in the add-on stays running when the panel syncs, and the panel follows it.
+
 ## 0.1.7
 
 - Publish port 8097 so the panel can start, pause, and reset the add-on timer.
