@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Leave the calendar and the add-on lines in place when a timer is cleared or reset.
+- Add a sidebar page with the live timer, today's lines, the last 7 calendar days, and a separate button that clears only the add-on lines.
+
 ## 0.1.2
 
 - Create the local calendar with the `calendar_name` field Home Assistant requires.

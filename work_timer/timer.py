@@ -120,20 +120,19 @@ def pause(user: dict[str, Any], now_epoch: int, when: str) -> tuple[int, int] | 
 
 
 def reset(user: dict[str, Any], now_epoch: int, when: str) -> dict[str, Any]:
-    """First reset stops and zeroes the timer. A second reset clears timestamps."""
-    if user.get("running") or int(user.get("elapsed_seconds") or 0) > 0:
-        interval = pause(user, now_epoch, when) if user.get("running") else None
-        user["elapsed_seconds"] = 0
-        user["running"] = False
-        user["segment_start"] = None
-        user["updated_at"] = now_epoch
-        return {"cleared": False, "interval": interval}
-    user["events"] = []
+    """Stop and zero the timer. Stored lines and the calendar stay."""
+    if not user.get("running") and int(user.get("elapsed_seconds") or 0) <= 0:
+        return {"interval": None}
+    interval = pause(user, now_epoch, when) if user.get("running") else None
+    user["elapsed_seconds"] = 0
+    user["running"] = False
+    user["segment_start"] = None
     user["updated_at"] = now_epoch
-    return {"cleared": True, "interval": None}
+    return {"interval": interval}
 
 
-def clear_events(user: dict[str, Any], now_epoch: int) -> None:
+def clear_addon_events(user: dict[str, Any], now_epoch: int) -> None:
+    """Drop this user's lines in the add-on. The calendar and the running timer stay."""
     user["events"] = []
     user["updated_at"] = now_epoch
 
@@ -141,14 +140,16 @@ def clear_events(user: dict[str, Any], now_epoch: int) -> None:
 def apply_command(user: dict[str, Any], command: str, now_epoch: int, when: str) -> dict[str, Any]:
     if command == "start":
         start(user, now_epoch, when)
-        return {"cleared": False, "interval": None}
+        return {"interval": None}
     if command == "pause":
-        return {"cleared": False, "interval": pause(user, now_epoch, when)}
+        return {"interval": pause(user, now_epoch, when)}
     if command == "reset":
         return reset(user, now_epoch, when)
     if command == "clear":
-        clear_events(user, now_epoch)
-        return {"cleared": True, "interval": None}
+        return {"interval": None}
+    if command == "clear_addon":
+        clear_addon_events(user, now_epoch)
+        return {"interval": None}
     raise ValueError(f"unknown command {command}")
 
 
@@ -158,6 +159,7 @@ def merge_users(server: dict[str, Any], client: dict[str, Any]) -> dict[str, Any
     client_at = int(client.get("updated_at") or 0)
     newer = client if client_at > server_at else server
     result = deepcopy(newer)
+    result["events"] = list(server.get("events") or [])
     both_running = bool(server.get("running")) and bool(client.get("running"))
     if not both_running:
         return result
@@ -170,7 +172,7 @@ def merge_users(server: dict[str, Any], client: dict[str, Any]) -> dict[str, Any
     if starts:
         result["segment_start"] = min(starts)
     result["elapsed_seconds"] = int(newer.get("elapsed_seconds") or 0)
-    result["events"] = list(newer.get("events") or [])
+    result["events"] = list(server.get("events") or [])
     result["updated_at"] = max(server_at, client_at)
     return result
 
@@ -286,10 +288,10 @@ def create_interval(token: str, entity: str, user: str, several_users: bool, sta
     )
 
 
-def delete_today(token: str, entity: str, user: str, several_users: bool, zone: ZoneInfo) -> None:
+def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, str]]:
     now = datetime.now(zone)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
+    start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     listed = _request(
         "POST",
         "/services/calendar/get_events",
@@ -300,25 +302,23 @@ def delete_today(token: str, entity: str, user: str, several_users: bool, zone: 
             "end_date_time": end.strftime("%Y-%m-%d %H:%M:%S"),
         },
     )
-    events: list[dict[str, Any]] = []
+    found: list[dict[str, Any]] = []
     if isinstance(listed, dict):
         service = listed.get("service_response") if isinstance(listed.get("service_response"), dict) else listed
         bucket = service.get(entity) if isinstance(service, dict) else None
         if isinstance(bucket, dict):
-            events = [item for item in bucket.get("events") or [] if isinstance(item, dict)]
-    summary = user if several_users else "Work"
-    for event in events:
-        if str(event.get("summary") or "") != summary:
-            continue
-        uid = event.get("uid")
-        if not uid:
-            continue
-        _request(
-            "POST",
-            "/services/calendar/delete_event",
-            token,
-            {"entity_id": entity, "uid": str(uid)},
+            found = [item for item in bucket.get("events") or [] if isinstance(item, dict)]
+    rows = []
+    for event in found:
+        rows.append(
+            {
+                "summary": str(event.get("summary") or ""),
+                "start": str(event.get("start") or ""),
+                "end": str(event.get("end") or ""),
+            }
         )
+    rows.sort(key=lambda item: item["start"], reverse=True)
+    return rows
 
 
 class TimerApp:
@@ -372,7 +372,7 @@ class TimerApp:
             now_epoch = int(now.timestamp())
             client = payload.get("state") if isinstance(payload.get("state"), dict) else None
             command = str(payload.get("command") or "").strip()
-            result: dict[str, Any] = {"cleared": False, "interval": None}
+            result: dict[str, Any] = {"interval": None}
             if command:
                 result = apply_command(user, command, now_epoch, hhmm(now))
             elif isinstance(client, dict) and "running" in client:
@@ -383,7 +383,7 @@ class TimerApp:
                 user = merged
                 closed = payload.get("closed_interval")
                 if isinstance(closed, list) and len(closed) == 2:
-                    result = {"cleared": False, "interval": (int(closed[0]), int(closed[1]))}
+                    result = {"interval": (int(closed[0]), int(closed[1]))}
             interval = result.get("interval")
             seen = user.setdefault("seen_intervals", [])
             if isinstance(interval, tuple):
@@ -391,13 +391,112 @@ class TimerApp:
                 if key not in seen:
                     seen.append(key)
                     self._write_interval(name, interval[0], interval[1])
-            if result.get("cleared"):
-                try:
-                    delete_today(self.ha_token, self.calendar_entity, name, len(self.users) > 1, self.zone)
-                except (OSError, RuntimeError) as err:
-                    print(f"calendar events were not cleared: {err}", flush=True)
             self.store.save()
             return public_user(user, now_epoch)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.store.lock:
+            history = calendar_events(self.ha_token, self.calendar_entity, self.zone)
+            several = len(self.users) > 1
+            now_epoch = int(self._now().timestamp())
+            users = []
+            for name in sorted(self.users):
+                user = self._user(name)
+                row = public_user(user, now_epoch)
+                row["name"] = name
+                if several:
+                    row["history"] = [item for item in history if item["summary"] == name]
+                else:
+                    row["history"] = history
+                users.append(row)
+            self.store.save()
+            return {"users": users}
+
+
+PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work Timer</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; color: #1f2933; background: #f7f7f5; }
+  h1 { font-size: 1.4rem; }
+  article { background: white; border-radius: 12px; padding: 16px 18px; margin: 0 0 16px; }
+  .time { font-size: 2rem; margin: 0; }
+  .state { margin: 0 0 8px; }
+  ul { padding-left: 18px; }
+  button { margin-top: 8px; }
+  p.note { max-width: 40rem; }
+</style>
+</head>
+<body>
+<h1>Work Timer</h1>
+<p class="note">Today's lines are kept by the add-on. Completed time stays on the calendar. Clearing here removes only the add-on lines. Remove calendar entries in the calendar itself.</p>
+<div id="users">Loading…</div>
+<script>
+async function load() {
+  const response = await fetch("api/view");
+  const data = await response.json();
+  const root = document.getElementById("users");
+  root.innerHTML = "";
+  for (const user of data.users || []) {
+    const card = document.createElement("article");
+    const title = document.createElement("h2");
+    title.textContent = user.name;
+    const state = document.createElement("p");
+    state.className = "state";
+    state.textContent = user.running ? "Running" : "Stopped";
+    const time = document.createElement("p");
+    time.className = "time";
+    time.textContent = user.elapsed || "00:00";
+    const today = document.createElement("h3");
+    today.textContent = "Today";
+    const lines = document.createElement("ul");
+    for (const event of user.events || []) {
+      const item = document.createElement("li");
+      item.textContent = (event.t || "") + " " + (event.kind || "");
+      lines.appendChild(item);
+    }
+    if (!lines.childElementCount) {
+      const item = document.createElement("li");
+      item.textContent = "No lines";
+      lines.appendChild(item);
+    }
+    const week = document.createElement("h3");
+    week.textContent = "Last 7 days";
+    const history = document.createElement("ul");
+    for (const event of user.history || []) {
+      const item = document.createElement("li");
+      item.textContent = (event.summary ? event.summary + " " : "") + (event.start || "") + " – " + (event.end || "");
+      history.appendChild(item);
+    }
+    if (!history.childElementCount) {
+      const item = document.createElement("li");
+      item.textContent = "No calendar entries";
+      history.appendChild(item);
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Clear add-on timestamps";
+    button.addEventListener("click", async () => {
+      await fetch("api/clear-addon", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({user: user.name})
+      });
+      load();
+    });
+    card.append(title, state, time, today, lines, week, history, button);
+    root.appendChild(card);
+  }
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
+"""
 
 
 def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
@@ -415,13 +514,51 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(raw)
 
+        def _send_html(self, page: str) -> None:
+            raw = page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _ingress(self) -> bool:
+            return bool(self.headers.get("X-Ingress-Path"))
+
         def _authorized(self) -> bool:
             if not token:
                 return False
             header = self.headers.get("Authorization", "")
             return header == f"Bearer {token}"
 
+        def _read_json(self) -> dict[str, Any] | None:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode() or "{}")
+            except (ValueError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
         def do_GET(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path.rstrip("/") or "/"
+            if path in ("/", "/index.html"):
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                self._send_html(PAGE)
+                return
+            if path == "/api/view":
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    self._send(200, app.snapshot())
+                except (OSError, RuntimeError) as err:
+                    self._send(502, {"error": str(err)})
+                return
+            if path != "/v1/timer":
+                self._send(404, {"error": "not found"})
+                return
             if not self._authorized():
                 self._send(401, {"error": "unauthorized"})
                 return
@@ -435,19 +572,31 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
             self._send(200, state)
 
         def do_POST(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path.rstrip("/")
+            if path == "/api/clear-addon":
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                payload = self._read_json()
+                if payload is None:
+                    self._send(400, {"error": "invalid json"})
+                    return
+                name = str(payload.get("user") or "panel")
+                try:
+                    state = app.handle(name, {"command": "clear_addon"})
+                except KeyError:
+                    self._send(404, {"error": f"no user {name}"})
+                    return
+                self._send(200, state)
+                return
             if not self._authorized():
                 self._send(401, {"error": "unauthorized"})
                 return
-            if urlparse(self.path).path.rstrip("/") != "/v1/timer":
+            if path != "/v1/timer":
                 self._send(404, {"error": "not found"})
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length).decode() or "{}")
-            except (ValueError, json.JSONDecodeError):
-                self._send(400, {"error": "invalid json"})
-                return
-            if not isinstance(payload, dict):
+            payload = self._read_json()
+            if payload is None:
                 self._send(400, {"error": "invalid json"})
                 return
             name = str(payload.get("user") or "panel")
