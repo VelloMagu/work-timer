@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.11
+
+- In the Last 5 days section, show only past days that have timestamp data (plus today when any day has data), and hide the section completely when there is no data.
+- Add month and year dropdown selectors to the calendar header for quick navigation.
+
 ## 0.1.10
 
 - Replace horizontal daily bars with 5 separate day timetable panels showing date on top, green start and red stop times, and daily total hours and minutes underneath.

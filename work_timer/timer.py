@@ -866,14 +866,8 @@ PAGE = """<!DOCTYPE html>
   /* Last 5 days panels */
   .five-days {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
     gap: 12px;
-  }
-  @media (max-width: 1040px) {
-    .five-days { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  }
-  @media (max-width: 700px) {
-    .five-days { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 480px) {
     body { padding: 14px 10px 32px; }
@@ -1015,15 +1009,31 @@ PAGE = """<!DOCTYPE html>
   }
   .cal-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     margin-bottom: 12px;
   }
-  .cal-month-label {
-    font-size: 0.98rem;
-    font-weight: 700;
-    margin: 0;
+  .cal-pickers {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .cal-select {
+    font: inherit;
+    font-size: 0.88rem;
+    font-weight: 650;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 6px 10px;
+    cursor: pointer;
+    outline: none;
+  }
+  .cal-select:hover, .cal-select:focus {
+    border-color: var(--accent);
   }
   .cal-nav {
     display: flex;
@@ -1380,16 +1390,52 @@ function renderCalendarArea(userName) {
 
   const calHead = document.createElement("div");
   calHead.className = "cal-header";
-  const monthLabel = document.createElement("h4");
-  monthLabel.className = "cal-month-label";
-  monthLabel.textContent = fmtMonthYear(st.year, st.month);
+
+  const pickers = document.createElement("div");
+  pickers.className = "cal-pickers";
+
+  const monthSelect = document.createElement("select");
+  monthSelect.className = "cal-select";
+  monthSelect.setAttribute("aria-label", "Month");
+  for (let m = 1; m <= 12; m++) {
+    const opt = document.createElement("option");
+    opt.value = String(m);
+    opt.textContent = new Date(2000, m - 1, 1).toLocaleDateString(undefined, { month: "long" });
+    if (m === st.month) opt.selected = true;
+    monthSelect.appendChild(opt);
+  }
+  monthSelect.addEventListener("change", () => {
+    st.month = parseInt(monthSelect.value, 10);
+    loadCalendarMonth(userName, true);
+  });
+
+  const yearSelect = document.createElement("select");
+  yearSelect.className = "cal-select";
+  yearSelect.setAttribute("aria-label", "Year");
+  const curYear = serverToday ? parseInt(serverToday.slice(0, 4), 10) : new Date().getFullYear();
+  const minYear = Math.min(curYear - 5, st.year - 1);
+  const maxYear = Math.max(curYear + 1, st.year + 1);
+  for (let y = maxYear; y >= minYear; y--) {
+    const opt = document.createElement("option");
+    opt.value = String(y);
+    opt.textContent = String(y);
+    if (y === st.year) opt.selected = true;
+    yearSelect.appendChild(opt);
+  }
+  yearSelect.addEventListener("change", () => {
+    st.year = parseInt(yearSelect.value, 10);
+    loadCalendarMonth(userName, true);
+  });
+
+  pickers.append(monthSelect, yearSelect);
 
   const nav = document.createElement("div");
   nav.className = "cal-nav";
   const prevBtn = document.createElement("button");
   prevBtn.type = "button";
   prevBtn.className = "ghost";
-  prevBtn.textContent = "‹ Prev";
+  prevBtn.textContent = "‹";
+  prevBtn.title = "Previous month";
   prevBtn.addEventListener("click", () => {
     st.month -= 1;
     if (st.month < 1) { st.month = 12; st.year -= 1; }
@@ -1411,7 +1457,8 @@ function renderCalendarArea(userName) {
   const nextBtn = document.createElement("button");
   nextBtn.type = "button";
   nextBtn.className = "ghost";
-  nextBtn.textContent = "Next ›";
+  nextBtn.textContent = "›";
+  nextBtn.title = "Next month";
   nextBtn.addEventListener("click", () => {
     st.month += 1;
     if (st.month > 12) { st.month = 1; st.year += 1; }
@@ -1419,7 +1466,7 @@ function renderCalendarArea(userName) {
   });
 
   nav.append(prevBtn, todayBtn, nextBtn);
-  calHead.append(monthLabel, nav);
+  calHead.append(pickers, nav);
 
   const weekdays = document.createElement("div");
   weekdays.className = "cal-weekdays";
@@ -1570,17 +1617,29 @@ function render(users) {
     actions.append(toggleBtn, resetBtn);
     hero.append(timerBox, actions);
 
-    // Last 5 days section (separate panel per day)
-    const fiveSection = document.createElement("section");
-    const fiveHeading = document.createElement("h3");
-    fiveHeading.className = "section-title";
-    fiveHeading.textContent = "Last 5 days";
-    const fiveGrid = document.createElement("div");
-    fiveGrid.className = "five-days";
-    for (const dayData of user.recent_days || []) {
-      fiveGrid.appendChild(buildDayPanel(dayData, user, { fullDate: false, showDuration: false }));
+    card.append(head, hero);
+
+    // Last 5 days section: except today, show only days with timestamp data.
+    // If no days in the last 5 have any timestamp data, hide the section completely.
+    const recentDays = user.recent_days || [];
+    const hasAnyData = recentDays.some((d) => d.intervals && d.intervals.length > 0);
+    const visibleDays = hasAnyData
+      ? recentDays.filter((d) => d.date === serverToday || (d.intervals && d.intervals.length > 0))
+      : [];
+
+    if (visibleDays.length) {
+      const fiveSection = document.createElement("section");
+      const fiveHeading = document.createElement("h3");
+      fiveHeading.className = "section-title";
+      fiveHeading.textContent = "Last 5 days";
+      const fiveGrid = document.createElement("div");
+      fiveGrid.className = "five-days";
+      for (const dayData of visibleDays) {
+        fiveGrid.appendChild(buildDayPanel(dayData, user, { fullDate: false, showDuration: false }));
+      }
+      fiveSection.append(fiveHeading, fiveGrid);
+      card.appendChild(fiveSection);
     }
-    fiveSection.append(fiveHeading, fiveGrid);
 
     // Calendar section underneath
     const calSection = document.createElement("section");
@@ -1592,7 +1651,7 @@ function render(users) {
     calArea.dataset.calArea = user.name;
     calSection.append(calHeading, calArea);
 
-    card.append(head, hero, fiveSection, calSection);
+    card.appendChild(calSection);
     root.appendChild(card);
 
     loadCalendarMonth(user.name, false);
