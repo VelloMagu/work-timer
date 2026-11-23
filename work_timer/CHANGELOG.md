@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Create the local calendar with the `calendar_name` field Home Assistant requires.
+
 ## 0.1.1
 
 - Start the timer with the add-on container environment so the Home Assistant API token is visible.

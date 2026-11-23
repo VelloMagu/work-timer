@@ -256,7 +256,7 @@ def ensure_calendar(token: str, calendar_name: str) -> str:
         "POST",
         f"/config/config_entries/flow/{flow['flow_id']}",
         token,
-        {"name": calendar_name},
+        {"calendar_name": calendar_name},
     )
     if isinstance(created, dict) and created.get("type") not in (None, "create_entry"):
         raise RuntimeError(f"Calendar setup did not finish: {created.get('type')}")
