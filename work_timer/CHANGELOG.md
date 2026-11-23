@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+- The sidebar can start, pause, and reset the timer, clear the panel screen, and clear the add-on lines.
+- The last 7 days show each day's total and a week total.
+
 ## 0.1.5
 
 - The sidebar loads the timer when Home Assistant requires a response from the calendar event lookup.

@@ -484,7 +484,7 @@ class TimerApp:
                 row["days"] = daily_totals(history, self.zone, total, name, several)
                 users.append(row)
             self.store.save()
-            return {"users": users}
+            return {"users": users, "server_now": now_epoch}
 
 
 PAGE = """<!DOCTYPE html>
@@ -494,98 +494,672 @@ PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Work Timer</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: sans-serif; margin: 24px; color: #1f2933; background: #f7f7f5; }
-  h1 { font-size: 1.4rem; }
-  article { background: #ffffff; border-radius: 12px; padding: 16px 18px; margin: 0 0 16px; }
-  .time { font-size: 2rem; margin: 0; }
-  .state { margin: 0 0 8px; }
-  ul { padding-left: 18px; }
-  button { margin-top: 8px; background: #e8e8e4; color: inherit; border: 0; border-radius: 8px; padding: 8px 12px; }
-  p.note { max-width: 40rem; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #111418; color: #e7e5e4; }
-    article { background: #1c2128; }
-    button { background: #2a313a; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f3f5f8;
+    --surface: #ffffff;
+    --surface-subtle: #f8fafc;
+    --border: rgba(15, 23, 42, 0.08);
+    --text: #0f172a;
+    --text-muted: #64748b;
+    --accent: #03a9f4;
+    --accent-soft: rgba(3, 169, 244, 0.12);
+    --green: #10b981;
+    --green-soft: rgba(16, 185, 129, 0.14);
+    --amber: #f59e0b;
+    --amber-soft: rgba(245, 158, 11, 0.15);
+    --red: #ef4444;
+    --red-soft: rgba(239, 68, 68, 0.12);
+    --btn-bg: #eef2f6;
+    --btn-hover: #e2e8f0;
+    --bar-track: #e9eef4;
+    --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 6px 20px rgba(15, 23, 42, 0.04);
   }
-  html.dark body { background: #111418; color: #e7e5e4; }
-  html.dark article { background: #1c2128; }
-  html.dark button { background: #2a313a; }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418;
+      --surface: #1b2028;
+      --surface-subtle: #222832;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-soft: rgba(56, 189, 248, 0.15);
+      --green: #34d399;
+      --green-soft: rgba(52, 211, 153, 0.16);
+      --amber: #fbbf24;
+      --amber-soft: rgba(251, 191, 36, 0.16);
+      --red: #f87171;
+      --red-soft: rgba(248, 113, 113, 0.16);
+      --btn-bg: #262d38;
+      --btn-hover: #313a48;
+      --bar-track: #262e3a;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.22);
+    }
+  }
+  html.dark {
+    --bg: #111418;
+    --surface: #1b2028;
+    --surface-subtle: #222832;
+    --border: rgba(255, 255, 255, 0.08);
+    --text: #f1f5f9;
+    --text-muted: #94a3b8;
+    --accent: #38bdf8;
+    --accent-soft: rgba(56, 189, 248, 0.15);
+    --green: #34d399;
+    --green-soft: rgba(52, 211, 153, 0.16);
+    --amber: #fbbf24;
+    --amber-soft: rgba(251, 191, 36, 0.16);
+    --red: #f87171;
+    --red-soft: rgba(248, 113, 113, 0.16);
+    --btn-bg: #262d38;
+    --btn-hover: #313a48;
+    --bar-track: #262e3a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.22);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 20px 40px;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.45;
+  }
+  .shell {
+    max-width: 1120px;
+    margin: 0 auto;
+  }
+  .topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px 20px;
+    margin-bottom: 22px;
+  }
+  .topbar h1 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .subtitle {
+    margin: 4px 0 0;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    max-width: 44rem;
+  }
+  .topbar-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 20px;
+  }
+  .grid.single {
+    grid-template-columns: minmax(0, 860px);
+    justify-content: center;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px 22px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .user-name {
+    margin: 0;
+    font-size: 1.125rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    text-transform: capitalize;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    background: var(--btn-bg);
+    color: var(--text-muted);
+  }
+  .badge.running {
+    background: var(--green-soft);
+    color: var(--green);
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .badge.running .dot {
+    animation: pulse 1.8s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.85); }
+  }
+  .hero {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 16px 18px;
+    border-radius: 12px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+  }
+  .timer-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 0 0 2px;
+  }
+  .time {
+    margin: 0;
+    font-size: 2.4rem;
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  button {
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 8px 14px;
+    cursor: pointer;
+    background: var(--btn-bg);
+    color: var(--text);
+    transition: background 0.15s ease, transform 0.08s ease, opacity 0.15s ease;
+  }
+  button:hover:not(:disabled) { background: var(--btn-hover); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: 0.55; cursor: default; }
+  button.primary {
+    background: var(--accent);
+    color: #ffffff;
+  }
+  button.primary:hover:not(:disabled) { filter: brightness(1.06); background: var(--accent); }
+  button.pause {
+    background: var(--amber-soft);
+    color: var(--amber);
+    border-color: rgba(245, 158, 11, 0.28);
+  }
+  button.pause:hover:not(:disabled) { filter: brightness(1.05); background: var(--amber-soft); }
+  button.danger {
+    background: var(--red-soft);
+    color: var(--red);
+  }
+  button.danger:hover:not(:disabled) { filter: brightness(1.06); background: var(--red-soft); }
+  button.ghost {
+    background: transparent;
+    border-color: var(--border);
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    padding: 6px 10px;
+  }
+  button.ghost:hover:not(:disabled) {
+    background: var(--btn-bg);
+    color: var(--text);
+  }
+  .sections {
+    display: grid;
+    grid-template-columns: 1.35fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 680px) {
+    body { padding: 16px 12px 32px; }
+    .grid { grid-template-columns: 1fr; }
+    .sections { grid-template-columns: 1fr; }
+    .time { font-size: 2rem; }
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .section-head h3 {
+    margin: 0;
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+  }
+  .week-total {
+    font-size: 0.82rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .bars {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .bar-row {
+    display: grid;
+    grid-template-columns: 62px 1fr 48px;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.84rem;
+  }
+  .bar-day {
+    color: var(--text-muted);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .bar-row.today .bar-day {
+    color: var(--text);
+    font-weight: 700;
+  }
+  .bar-track {
+    height: 10px;
+    border-radius: 999px;
+    background: var(--bar-track);
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--accent);
+    opacity: 0.72;
+    transition: width 0.25s ease;
+  }
+  .bar-row.today .bar-fill {
+    opacity: 1;
+    background: var(--green);
+  }
+  .bar-val {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .bar-val.zero {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .events {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .event-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    border-radius: 9px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    font-size: 0.84rem;
+  }
+  .event-time {
+    font-variant-numeric: tabular-nums;
+    font-weight: 650;
+  }
+  .event-kind {
+    font-size: 0.74rem;
+    font-weight: 650;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--btn-bg);
+    color: var(--text-muted);
+  }
+  .event-kind.start {
+    background: var(--green-soft);
+    color: var(--green);
+  }
+  .event-kind.pause {
+    background: var(--amber-soft);
+    color: var(--amber);
+  }
+  .empty {
+    font-size: 0.84rem;
+    color: var(--text-muted);
+    padding: 12px;
+    border-radius: 10px;
+    background: var(--surface-subtle);
+    border: 1px dashed var(--border);
+    text-align: center;
+  }
+  .card-foot {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .status-banner {
+    padding: 16px 18px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
 </style>
 </head>
 <body>
-<h1>Work Timer</h1>
-<p class="note">Today's lines are kept by the add-on. Completed time stays on the calendar. Clearing here removes only the add-on lines. Remove calendar entries in the calendar itself.</p>
-<div id="users">Loading…</div>
+<div class="shell">
+  <header class="topbar">
+    <div>
+      <h1>Work Timer</h1>
+      <p class="subtitle">Today's lines stay in the add-on while completed intervals are saved to your Home Assistant calendar. Clearing here only drops add-on or panel lines.</p>
+    </div>
+    <div class="topbar-meta">
+      <span id="synced">Syncing…</span>
+      <button id="refreshBtn" class="ghost" type="button">Refresh</button>
+    </div>
+  </header>
+  <main id="users" class="status-banner">Loading…</main>
+</div>
 <script>
+let currentUsers = [];
+let serverOffsetSec = 0;
+
+function parseHHMM(text) {
+  const parts = String(text || "00:00").split(":");
+  if (parts.length !== 2) return 0;
+  return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60;
+}
+
+function fmtHMS(totalSec) {
+  const s = Math.max(0, Math.floor(totalSec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+}
+
+function fmtHM(totalSec) {
+  const m = Math.max(0, Math.floor(totalSec / 60));
+  return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+}
+
+function fmtDayLabel(iso, isToday) {
+  if (isToday) return "Today";
+  const d = new Date(iso + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric" });
+}
+
+function liveSeconds(user) {
+  let total = Number(user.elapsed_seconds || 0);
+  if (user.running && typeof user.segment_start === "number") {
+    const nowSec = Math.floor(Date.now() / 1000) + serverOffsetSec;
+    total += Math.max(0, nowSec - user.segment_start);
+  }
+  return total;
+}
+
+async function sendCommand(userName, command, button) {
+  if (command === "reset" && !window.confirm("Reset today's timer for " + userName + " to 00:00? Completed calendar entries will be kept.")) {
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    await fetch("api/command", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({user: userName, command})
+    });
+  } finally {
+    await load();
+  }
+}
+
+function render(users) {
+  const root = document.getElementById("users");
+  root.className = users.length <= 1 ? "grid single" : "grid";
+  root.innerHTML = "";
+  if (!users.length) {
+    root.className = "status-banner";
+    root.textContent = "No users configured.";
+    return;
+  }
+
+  for (const user of users) {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.dataset.user = user.name;
+
+    // Header
+    const head = document.createElement("div");
+    head.className = "card-head";
+    const title = document.createElement("h2");
+    title.className = "user-name";
+    title.textContent = user.name;
+    const badge = document.createElement("span");
+    badge.className = "badge" + (user.running ? " running" : "");
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    badge.append(dot, document.createTextNode(user.running ? "Running" : "Stopped"));
+    head.append(title, badge);
+
+    // Hero timer & primary controls
+    const hero = document.createElement("div");
+    hero.className = "hero";
+    const timerBox = document.createElement("div");
+    const timerLabel = document.createElement("p");
+    timerLabel.className = "timer-label";
+    timerLabel.textContent = "Today's total";
+    const timeEl = document.createElement("p");
+    timeEl.className = "time";
+    timeEl.dataset.timer = user.name;
+    const secNow = liveSeconds(user);
+    timeEl.textContent = fmtHMS(secNow);
+    timerBox.append(timerLabel, timeEl);
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const toggleBtn = document.createElement("button");
+    toggleBtn.type = "button";
+    toggleBtn.className = user.running ? "pause" : "primary";
+    toggleBtn.textContent = user.running ? "Pause" : "Start";
+    toggleBtn.addEventListener("click", () => sendCommand(user.name, user.running ? "pause" : "start", toggleBtn));
+
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "danger";
+    resetBtn.textContent = "Reset";
+    resetBtn.disabled = !user.running && secNow <= 0;
+    resetBtn.addEventListener("click", () => sendCommand(user.name, "reset", resetBtn));
+
+    actions.append(toggleBtn, resetBtn);
+    hero.append(timerBox, actions);
+
+    // Two-column body: 7-day bars + today's events
+    const sections = document.createElement("div");
+    sections.className = "sections";
+
+    // Left: 7-day chart
+    const weekPanel = document.createElement("section");
+    weekPanel.className = "panel";
+    const days = user.days || [];
+    const daySecs = days.map((d, idx) => idx === days.length - 1 ? secNow : parseHHMM(d.total));
+    const maxSec = Math.max(3600, ...daySecs);
+    const weekSum = daySecs.reduce((acc, v) => acc + v, 0);
+
+    const weekHead = document.createElement("div");
+    weekHead.className = "section-head";
+    const weekTitle = document.createElement("h3");
+    weekTitle.textContent = "Last 7 days";
+    const weekTotal = document.createElement("span");
+    weekTotal.className = "week-total";
+    weekTotal.textContent = "Total " + fmtHM(weekSum);
+    weekHead.append(weekTitle, weekTotal);
+
+    const bars = document.createElement("div");
+    bars.className = "bars";
+    if (!days.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No calendar entries";
+      bars.appendChild(empty);
+    } else {
+      days.forEach((day, idx) => {
+        const isToday = idx === days.length - 1;
+        const valSec = daySecs[idx];
+        const row = document.createElement("div");
+        row.className = "bar-row" + (isToday ? " today" : "");
+        row.title = day.date + " — " + fmtHM(valSec);
+
+        const dayLbl = document.createElement("span");
+        dayLbl.className = "bar-day";
+        dayLbl.textContent = fmtDayLabel(day.date, isToday);
+
+        const track = document.createElement("div");
+        track.className = "bar-track";
+        const fill = document.createElement("div");
+        fill.className = "bar-fill";
+        fill.style.width = (valSec > 0 ? Math.max(4, Math.round((valSec / maxSec) * 100)) : 0) + "%";
+        track.appendChild(fill);
+
+        const valLbl = document.createElement("span");
+        valLbl.className = "bar-val" + (valSec <= 0 ? " zero" : "");
+        valLbl.textContent = fmtHM(valSec);
+
+        row.append(dayLbl, track, valLbl);
+        bars.appendChild(row);
+      });
+    }
+    weekPanel.append(weekHead, bars);
+
+    // Right: Today's activity log
+    const todayPanel = document.createElement("section");
+    todayPanel.className = "panel";
+    const todayHead = document.createElement("div");
+    todayHead.className = "section-head";
+    const todayTitle = document.createElement("h3");
+    todayTitle.textContent = "Today's activity";
+    todayHead.appendChild(todayTitle);
+
+    const events = user.events || [];
+    if (!events.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No timestamps yet";
+      todayPanel.append(todayHead, empty);
+    } else {
+      const list = document.createElement("ul");
+      list.className = "events";
+      for (const ev of [...events].reverse()) {
+        const item = document.createElement("li");
+        item.className = "event-item";
+        const t = document.createElement("span");
+        t.className = "event-time";
+        t.textContent = ev.t || "--:--";
+        const k = document.createElement("span");
+        const kind = String(ev.kind || "").toLowerCase();
+        k.className = "event-kind " + (kind === "start" || kind === "pause" ? kind : "");
+        k.textContent = ev.kind || "";
+        item.append(t, k);
+        list.appendChild(item);
+      }
+      todayPanel.append(todayHead, list);
+    }
+
+    sections.append(weekPanel, todayPanel);
+
+    // Footer utility buttons
+    const foot = document.createElement("div");
+    foot.className = "card-foot";
+    const clearPanelBtn = document.createElement("button");
+    clearPanelBtn.type = "button";
+    clearPanelBtn.className = "ghost";
+    clearPanelBtn.textContent = "Clear panel screen";
+    clearPanelBtn.addEventListener("click", () => sendCommand(user.name, "clear", clearPanelBtn));
+
+    const clearAddonBtn = document.createElement("button");
+    clearAddonBtn.type = "button";
+    clearAddonBtn.className = "ghost";
+    clearAddonBtn.textContent = "Clear add-on timestamps";
+    clearAddonBtn.addEventListener("click", () => sendCommand(user.name, "clear_addon", clearAddonBtn));
+
+    foot.append(clearPanelBtn, clearAddonBtn);
+    card.append(head, hero, sections, foot);
+    root.appendChild(card);
+  }
+}
+
+function tick() {
+  for (const user of currentUsers) {
+    if (!user.running) continue;
+    const el = document.querySelector('[data-timer="' + CSS.escape(user.name) + '"]');
+    if (el) el.textContent = fmtHMS(liveSeconds(user));
+  }
+}
+
 async function load() {
   const root = document.getElementById("users");
+  const synced = document.getElementById("synced");
   let data;
   try {
     const response = await fetch("api/view");
     data = await response.json();
   } catch (err) {
+    root.className = "status-banner";
     root.textContent = "The timer could not be loaded.";
     return;
   }
   if (!data || data.error) {
+    root.className = "status-banner";
     root.textContent = (data && data.error) || "The timer could not be loaded.";
     return;
   }
-  root.innerHTML = "";
-  for (const user of data.users || []) {
-    const card = document.createElement("article");
-    const title = document.createElement("h2");
-    title.textContent = user.name;
-    const state = document.createElement("p");
-    state.className = "state";
-    state.textContent = user.running ? "Running" : "Stopped";
-    const time = document.createElement("p");
-    time.className = "time";
-    time.textContent = user.elapsed || "00:00";
-    const today = document.createElement("h3");
-    today.textContent = "Today";
-    const lines = document.createElement("ul");
-    for (const event of user.events || []) {
-      const item = document.createElement("li");
-      item.textContent = (event.t || "") + " " + (event.kind || "");
-      lines.appendChild(item);
-    }
-    if (!lines.childElementCount) {
-      const item = document.createElement("li");
-      item.textContent = "No lines";
-      lines.appendChild(item);
-    }
-    const week = document.createElement("h3");
-    week.textContent = "Daily totals";
-    const history = document.createElement("ul");
-    for (const day of user.days || []) {
-      const item = document.createElement("li");
-      item.textContent = day.date + " " + (day.total || "00:00");
-      history.appendChild(item);
-    }
-    if (!history.childElementCount) {
-      const item = document.createElement("li");
-      item.textContent = "No calendar entries";
-      history.appendChild(item);
-    }
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Clear add-on timestamps";
-    button.addEventListener("click", async () => {
-      await fetch("api/clear-addon", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({user: user.name})
-      });
-      load();
-    });
-    card.append(title, state, time, today, lines, week, history, button);
-    root.appendChild(card);
+  if (typeof data.server_now === "number") {
+    serverOffsetSec = data.server_now - Math.floor(Date.now() / 1000);
   }
+  currentUsers = data.users || [];
+  render(currentUsers);
+  synced.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+
+document.getElementById("refreshBtn").addEventListener("click", load);
 load();
 setInterval(load, 15000);
+setInterval(tick, 1000);
+
 function followTheme() {
   try {
     const parent = window.parent.document.documentElement;
@@ -676,7 +1250,7 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/")
-            if path == "/api/clear-addon":
+            if path in ("/api/clear-addon", "/api/command"):
                 if not (self._ingress() or self._authorized()):
                     self._send(401, {"error": "unauthorized"})
                     return
@@ -685,10 +1259,14 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
                     self._send(400, {"error": "invalid json"})
                     return
                 name = str(payload.get("user") or "panel")
+                command = "clear_addon" if path == "/api/clear-addon" else str(payload.get("command") or "").strip()
                 try:
-                    state = app.handle(name, {"command": "clear_addon"})
+                    state = app.handle(name, {"command": command})
                 except KeyError:
                     self._send(404, {"error": f"no user {name}"})
+                    return
+                except ValueError as err:
+                    self._send(400, {"error": str(err)})
                     return
                 self._send(200, state)
                 return
