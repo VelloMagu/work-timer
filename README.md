@@ -1,5 +1,7 @@
 # Work Timer
 
+This add-on was built by AI. It might not be updated.
+
 Home Assistant add-on. It keeps a work timer for each configured user and writes each completed interval to a local calendar.
 
 The add-on does not listen, and does not create a calendar, until `calendar_name` is set in the add-on options.
