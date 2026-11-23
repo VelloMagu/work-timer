@@ -4,7 +4,14 @@ This add-on was built by AI. It might not be updated.
 
 Home Assistant add-on. It keeps a work timer for each configured user and writes each completed interval to a local calendar.
 
-The add-on does not listen, and does not create a calendar, until `calendar_name` is set in the add-on options.
+## Install
+
+1. In Home Assistant, open Settings, Add-ons, Add-on store, then the menu, Repositories.
+2. Add `https://github.com/VelloMagu/work-timer`.
+3. Install **Work Timer**.
+4. Set `calendar_name` to the local calendar you want. The add-on does not listen, and does not create a calendar, until this is set.
+5. Set a long random `token`. Leave `port` at `8097` unless that port is already in use. `users` lists one timer name per person. A panel uses the matching name, `panel` by default.
+6. Start the add-on. It creates or reuses the local calendar with that name.
 
 ## Options
 
