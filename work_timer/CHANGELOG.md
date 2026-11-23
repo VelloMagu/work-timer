@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- A clear asks the panel to drop its on-screen lines and leaves the add-on lines and the calendar in place.
+- Reset sets today's counter back to 00:00.
+- The sidebar shows a work total for each of the last 7 days and follows light and dark mode.
+
 ## 0.1.3
 
 - Leave the calendar and the add-on lines in place when a timer is cleared or reset.

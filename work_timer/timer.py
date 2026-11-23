@@ -62,6 +62,7 @@ def public_user(user: dict[str, Any], now_epoch: int) -> dict[str, Any]:
         "updated_at": int(user.get("updated_at") or 0),
         "day": user.get("day") or "",
         "elapsed": elapsed_label(user, now_epoch),
+        "display_cleared_at": int(user.get("display_cleared_at") or 0),
     }
 
 
@@ -137,6 +138,12 @@ def clear_addon_events(user: dict[str, Any], now_epoch: int) -> None:
     user["updated_at"] = now_epoch
 
 
+def mark_display_cleared(user: dict[str, Any], now_epoch: int) -> None:
+    """Ask the panel to drop its on-screen lines. Stored lines and the calendar stay."""
+    user["display_cleared_at"] = now_epoch
+    user["updated_at"] = now_epoch
+
+
 def apply_command(user: dict[str, Any], command: str, now_epoch: int, when: str) -> dict[str, Any]:
     if command == "start":
         start(user, now_epoch, when)
@@ -146,6 +153,7 @@ def apply_command(user: dict[str, Any], command: str, now_epoch: int, when: str)
     if command == "reset":
         return reset(user, now_epoch, when)
     if command == "clear":
+        mark_display_cleared(user, now_epoch)
         return {"interval": None}
     if command == "clear_addon":
         clear_addon_events(user, now_epoch)
@@ -160,6 +168,7 @@ def merge_users(server: dict[str, Any], client: dict[str, Any]) -> dict[str, Any
     newer = client if client_at > server_at else server
     result = deepcopy(newer)
     result["events"] = list(server.get("events") or [])
+    result["display_cleared_at"] = int(server.get("display_cleared_at") or 0)
     both_running = bool(server.get("running")) and bool(client.get("running"))
     if not both_running:
         return result
@@ -321,6 +330,50 @@ def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, s
     return rows
 
 
+def _moment(value: str, zone: ZoneInfo) -> datetime | None:
+    text = value.strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=zone)
+    return moment.astimezone(zone)
+
+
+def _hhmm_seconds(total: int) -> str:
+    minutes = max(0, total) // 60
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def daily_totals(events: list[dict[str, str]], zone: ZoneInfo, today_seconds: int, user_name: str, several: bool) -> list[dict[str, str]]:
+    now = datetime.now(zone)
+    today = now.date()
+    rows = []
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        rows.append({"date": day.isoformat(), "seconds": 0})
+    by_date = {row["date"]: row for row in rows}
+    for event in events:
+        if several and event.get("summary") != user_name:
+            continue
+        start = _moment(event.get("start") or "", zone)
+        end = _moment(event.get("end") or "", zone)
+        if start is None or end is None or end <= start:
+            continue
+        key = start.date().isoformat()
+        if key == today.isoformat() or key not in by_date:
+            continue
+        by_date[key]["seconds"] += int((end - start).total_seconds())
+    by_date[today.isoformat()]["seconds"] = max(0, today_seconds)
+    for row in rows:
+        row["total"] = _hhmm_seconds(int(row["seconds"]))
+        del row["seconds"]
+    return rows
+
+
 class TimerApp:
     def __init__(self, options: dict[str, Any], calendar_entity: str, zone: ZoneInfo, ha_token: str) -> None:
         self.options = options
@@ -405,9 +458,15 @@ class TimerApp:
                 row = public_user(user, now_epoch)
                 row["name"] = name
                 if several:
-                    row["history"] = [item for item in history if item["summary"] == name]
+                    visible = [item for item in history if item["summary"] == name]
                 else:
-                    row["history"] = history
+                    visible = history
+                row["history"] = visible
+                total = int(user.get("elapsed_seconds") or 0)
+                start = user.get("segment_start")
+                if user.get("running") and isinstance(start, (int, float)):
+                    total += max(0, now_epoch - int(start))
+                row["days"] = daily_totals(history, self.zone, total, name, several)
                 users.append(row)
             self.store.save()
             return {"users": users}
@@ -420,14 +479,23 @@ PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Work Timer</title>
 <style>
+  :root { color-scheme: light dark; }
   body { font-family: sans-serif; margin: 24px; color: #1f2933; background: #f7f7f5; }
   h1 { font-size: 1.4rem; }
-  article { background: white; border-radius: 12px; padding: 16px 18px; margin: 0 0 16px; }
+  article { background: #ffffff; border-radius: 12px; padding: 16px 18px; margin: 0 0 16px; }
   .time { font-size: 2rem; margin: 0; }
   .state { margin: 0 0 8px; }
   ul { padding-left: 18px; }
-  button { margin-top: 8px; }
+  button { margin-top: 8px; background: #e8e8e4; color: inherit; border: 0; border-radius: 8px; padding: 8px 12px; }
   p.note { max-width: 40rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111418; color: #e7e5e4; }
+    article { background: #1c2128; }
+    button { background: #2a313a; }
+  }
+  html.dark body { background: #111418; color: #e7e5e4; }
+  html.dark article { background: #1c2128; }
+  html.dark button { background: #2a313a; }
 </style>
 </head>
 <body>
@@ -464,11 +532,11 @@ async function load() {
       lines.appendChild(item);
     }
     const week = document.createElement("h3");
-    week.textContent = "Last 7 days";
+    week.textContent = "Daily totals";
     const history = document.createElement("ul");
-    for (const event of user.history || []) {
+    for (const day of user.days || []) {
       const item = document.createElement("li");
-      item.textContent = (event.summary ? event.summary + " " : "") + (event.start || "") + " – " + (event.end || "");
+      item.textContent = day.date + " " + (day.total || "00:00");
       history.appendChild(item);
     }
     if (!history.childElementCount) {
@@ -493,6 +561,16 @@ async function load() {
 }
 load();
 setInterval(load, 15000);
+function followTheme() {
+  try {
+    const parent = window.parent.document.documentElement;
+    const style = window.parent.getComputedStyle(parent);
+    const dark = parent.classList.contains("dark") || style.colorScheme === "dark";
+    document.documentElement.classList.toggle("dark", dark);
+  } catch (err) {}
+}
+followTheme();
+setInterval(followTheme, 2000);
 </script>
 </body>
 </html>

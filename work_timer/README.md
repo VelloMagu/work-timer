@@ -24,6 +24,6 @@ Home Assistant add-on. It keeps a work timer for each configured user and writes
 
 `GET /v1/timer?user=panel` and `POST /v1/timer` with a bearer token.
 
-The POST body can include `command` (`start`, `pause`, `reset`, or `clear`) and a `state` object. `reset` stops and zeroes the timer. `clear` does not remove stored lines or calendar events. The sidebar has a separate button that removes only the add-on lines. Calendar entries are removed in the calendar itself.
+The POST body can include `command` (`start`, `pause`, `reset`, or `clear`) and a `state` object. `reset` stops the timer and sets today's counter to `00:00`. `clear` asks the panel to drop its on-screen lines. Neither command removes stored lines or calendar events. The sidebar shows a total for each of the last 7 days. Today follows the counter, so a reset shows `00:00`.
 
 A restart of the add-on or the panel is not a pause. On reconnect, an open segment keeps the earlier start time.
