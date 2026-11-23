@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Replace horizontal daily bars with 5 separate day timetable panels showing date on top, green start and red stop times, and daily total hours and minutes underneath.
+- Add an interactive monthly calendar underneath where clicking any day displays its timetable.
+
 ## 0.1.9
 
 - A pause from the panel stays paused. An older running update no longer starts the timer again.

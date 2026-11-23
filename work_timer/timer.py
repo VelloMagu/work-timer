@@ -322,10 +322,9 @@ def create_interval(token: str, entity: str, user: str, several_users: bool, sta
     )
 
 
-def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, str]]:
-    now = datetime.now(zone)
-    start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+def calendar_events_range(
+    token: str, entity: str, zone: ZoneInfo, start: datetime, end: datetime
+) -> list[dict[str, str]]:
     listed = _request(
         "POST",
         "/services/calendar/get_events",
@@ -354,6 +353,80 @@ def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, s
         )
     rows.sort(key=lambda item: item["start"], reverse=True)
     return rows
+
+
+def calendar_events(token: str, entity: str, zone: ZoneInfo) -> list[dict[str, str]]:
+    now = datetime.now(zone)
+    start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return calendar_events_range(token, entity, zone, start, end)
+
+
+def build_timetables(
+    events: list[dict[str, str]],
+    zone: ZoneInfo,
+    dates: list[str],
+    user_name: str,
+    several: bool,
+    active_user: dict[str, Any] | None = None,
+    now_epoch: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    by_date: dict[str, list[tuple[datetime, dict[str, Any]]]] = {d: [] for d in dates}
+    for event in events:
+        if several and event.get("summary") != user_name:
+            continue
+        start = _moment(event.get("start") or "", zone)
+        end = _moment(event.get("end") or "", zone)
+        if start is None or end is None or end <= start:
+            continue
+        key = start.date().isoformat()
+        if key not in by_date:
+            continue
+        secs = int((end - start).total_seconds())
+        by_date[key].append(
+            (
+                start,
+                {
+                    "start": start.strftime("%H:%M"),
+                    "end": end.strftime("%H:%M"),
+                    "seconds": secs,
+                    "running": False,
+                },
+            )
+        )
+    if (
+        active_user is not None
+        and now_epoch is not None
+        and active_user.get("running")
+        and isinstance(active_user.get("segment_start"), (int, float))
+    ):
+        seg_start = int(active_user["segment_start"])
+        seg_dt = datetime.fromtimestamp(seg_start, zone)
+        key = seg_dt.date().isoformat()
+        if key in by_date:
+            by_date[key].append(
+                (
+                    seg_dt,
+                    {
+                        "start": seg_dt.strftime("%H:%M"),
+                        "end": None,
+                        "seconds": max(0, now_epoch - seg_start),
+                        "running": True,
+                    },
+                )
+            )
+    result: dict[str, dict[str, Any]] = {}
+    for day in dates:
+        items = sorted(by_date[day], key=lambda pair: pair[0])
+        intervals = [item for _, item in items]
+        total_secs = sum(int(item["seconds"]) for item in intervals)
+        result[day] = {
+            "date": day,
+            "intervals": intervals,
+            "total_seconds": total_secs,
+            "total": _hhmm_seconds(total_secs),
+        }
+    return result
 
 
 def _moment(value: str, zone: ZoneInfo) -> datetime | None:
@@ -481,7 +554,10 @@ class TimerApp:
                 print(f"calendar events were not loaded: {err}", flush=True)
                 history = []
             several = len(self.users) > 1
-            now_epoch = int(self._now().timestamp())
+            now = self._now()
+            now_epoch = int(now.timestamp())
+            today = now.date()
+            last5 = [(today - timedelta(days=offset)).isoformat() for offset in range(4, -1, -1)]
             users = []
             for name in sorted(self.users):
                 user = self._user(name)
@@ -497,9 +573,41 @@ class TimerApp:
                 if user.get("running") and isinstance(start, (int, float)):
                     total += max(0, now_epoch - int(start))
                 row["days"] = daily_totals(history, self.zone, total, name, several)
+                timetables = build_timetables(history, self.zone, last5, name, several, user, now_epoch)
+                row["recent_days"] = [timetables[d] for d in last5]
                 users.append(row)
             self.store.save()
-            return {"users": users, "server_now": now_epoch}
+            return {"users": users, "server_now": now_epoch, "today": today.isoformat()}
+
+    def month_calendar(self, name: str, year: int, month: int) -> dict[str, Any]:
+        if name not in self.users:
+            raise KeyError(name)
+        if not (1 <= month <= 12) or not (2000 <= year <= 2100):
+            raise ValueError("invalid year or month")
+        start = datetime(year, month, 1, 0, 0, 0, tzinfo=self.zone)
+        if month == 12:
+            end = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=self.zone)
+        else:
+            end = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=self.zone)
+        num_days = (end.date() - start.date()).days
+        dates = [(start.date() + timedelta(days=i)).isoformat() for i in range(num_days)]
+        with self.store.lock:
+            try:
+                events = calendar_events_range(self.ha_token, self.calendar_entity, self.zone, start, end)
+            except (OSError, RuntimeError, json.JSONDecodeError) as err:
+                print(f"calendar month was not loaded: {err}", flush=True)
+                events = []
+            user = self._user(name)
+            now_epoch = int(self._now().timestamp())
+            several = len(self.users) > 1
+            timetables = build_timetables(events, self.zone, dates, name, several, user, now_epoch)
+            return {
+                "user": name,
+                "year": year,
+                "month": month,
+                "days": timetables,
+                "server_now": now_epoch,
+            }
 
 
 PAGE = """<!DOCTYPE html>
@@ -514,20 +622,19 @@ PAGE = """<!DOCTYPE html>
     --bg: #f3f5f8;
     --surface: #ffffff;
     --surface-subtle: #f8fafc;
-    --border: rgba(15, 23, 42, 0.08);
+    --border: rgba(15, 23, 42, 0.09);
     --text: #0f172a;
     --text-muted: #64748b;
     --accent: #03a9f4;
-    --accent-soft: rgba(3, 169, 244, 0.12);
-    --green: #10b981;
-    --green-soft: rgba(16, 185, 129, 0.14);
-    --amber: #f59e0b;
-    --amber-soft: rgba(245, 158, 11, 0.15);
-    --red: #ef4444;
-    --red-soft: rgba(239, 68, 68, 0.12);
+    --accent-soft: rgba(3, 169, 244, 0.14);
+    --green: #16a34a;
+    --green-soft: rgba(22, 163, 74, 0.12);
+    --red: #dc2626;
+    --red-soft: rgba(220, 38, 38, 0.11);
+    --amber: #d97706;
+    --amber-soft: rgba(217, 119, 6, 0.14);
     --btn-bg: #eef2f6;
     --btn-hover: #e2e8f0;
-    --bar-track: #e9eef4;
     --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 6px 20px rgba(15, 23, 42, 0.04);
   }
   @media (prefers-color-scheme: dark) {
@@ -535,20 +642,19 @@ PAGE = """<!DOCTYPE html>
       --bg: #111418;
       --surface: #1b2028;
       --surface-subtle: #222832;
-      --border: rgba(255, 255, 255, 0.08);
+      --border: rgba(255, 255, 255, 0.09);
       --text: #f1f5f9;
       --text-muted: #94a3b8;
       --accent: #38bdf8;
-      --accent-soft: rgba(56, 189, 248, 0.15);
-      --green: #34d399;
-      --green-soft: rgba(52, 211, 153, 0.16);
+      --accent-soft: rgba(56, 189, 248, 0.16);
+      --green: #4ade80;
+      --green-soft: rgba(74, 222, 128, 0.14);
+      --red: #f87171;
+      --red-soft: rgba(248, 113, 113, 0.14);
       --amber: #fbbf24;
       --amber-soft: rgba(251, 191, 36, 0.16);
-      --red: #f87171;
-      --red-soft: rgba(248, 113, 113, 0.16);
       --btn-bg: #262d38;
       --btn-hover: #313a48;
-      --bar-track: #262e3a;
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.22);
     }
   }
@@ -556,33 +662,32 @@ PAGE = """<!DOCTYPE html>
     --bg: #111418;
     --surface: #1b2028;
     --surface-subtle: #222832;
-    --border: rgba(255, 255, 255, 0.08);
+    --border: rgba(255, 255, 255, 0.09);
     --text: #f1f5f9;
     --text-muted: #94a3b8;
     --accent: #38bdf8;
-    --accent-soft: rgba(56, 189, 248, 0.15);
-    --green: #34d399;
-    --green-soft: rgba(52, 211, 153, 0.16);
+    --accent-soft: rgba(56, 189, 248, 0.16);
+    --green: #4ade80;
+    --green-soft: rgba(74, 222, 128, 0.14);
+    --red: #f87171;
+    --red-soft: rgba(248, 113, 113, 0.14);
     --amber: #fbbf24;
     --amber-soft: rgba(251, 191, 36, 0.16);
-    --red: #f87171;
-    --red-soft: rgba(248, 113, 113, 0.16);
     --btn-bg: #262d38;
     --btn-hover: #313a48;
-    --bar-track: #262e3a;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.22);
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    padding: 24px 20px 40px;
+    padding: 24px 20px 44px;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: var(--bg);
     color: var(--text);
     line-height: 1.45;
   }
   .shell {
-    max-width: 1120px;
+    max-width: 1240px;
     margin: 0 auto;
   }
   .topbar {
@@ -603,7 +708,7 @@ PAGE = """<!DOCTYPE html>
     margin: 4px 0 0;
     font-size: 0.875rem;
     color: var(--text-muted);
-    max-width: 44rem;
+    max-width: 46rem;
   }
   .topbar-meta {
     display: flex;
@@ -612,14 +717,10 @@ PAGE = """<!DOCTYPE html>
     font-size: 0.8rem;
     color: var(--text-muted);
   }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-    gap: 20px;
-  }
-  .grid.single {
-    grid-template-columns: minmax(0, 860px);
-    justify-content: center;
+  .users-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
   }
   .card {
     background: var(--surface);
@@ -629,18 +730,25 @@ PAGE = """<!DOCTYPE html>
     box-shadow: var(--shadow);
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: 20px;
   }
   .card-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
+    gap: 14px;
+  }
+  .head-left {
+    display: flex;
+    align-items: center;
     gap: 12px;
+    flex-wrap: wrap;
   }
   .user-name {
     margin: 0;
-    font-size: 1.125rem;
-    font-weight: 650;
+    font-size: 1.2rem;
+    font-weight: 700;
     letter-spacing: -0.01em;
     text-transform: capitalize;
   }
@@ -678,13 +786,13 @@ PAGE = """<!DOCTYPE html>
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 16px 18px;
+    padding: 14px 18px;
     border-radius: 12px;
     background: var(--surface-subtle);
     border: 1px solid var(--border);
   }
   .timer-label {
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--text-muted);
@@ -692,7 +800,7 @@ PAGE = """<!DOCTYPE html>
   }
   .time {
     margin: 0;
-    font-size: 2.4rem;
+    font-size: 2.2rem;
     font-weight: 700;
     line-height: 1.05;
     letter-spacing: -0.02em;
@@ -701,11 +809,12 @@ PAGE = """<!DOCTYPE html>
   .actions {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 8px;
   }
   button {
     font: inherit;
-    font-size: 0.85rem;
+    font-size: 0.84rem;
     font-weight: 600;
     border: 1px solid transparent;
     border-radius: 10px;
@@ -717,16 +826,16 @@ PAGE = """<!DOCTYPE html>
   }
   button:hover:not(:disabled) { background: var(--btn-hover); }
   button:active:not(:disabled) { transform: translateY(1px); }
-  button:disabled { opacity: 0.55; cursor: default; }
+  button:disabled { opacity: 0.5; cursor: default; }
   button.primary {
-    background: var(--accent);
+    background: var(--green);
     color: #ffffff;
   }
-  button.primary:hover:not(:disabled) { filter: brightness(1.06); background: var(--accent); }
+  button.primary:hover:not(:disabled) { filter: brightness(1.06); background: var(--green); }
   button.pause {
     background: var(--amber-soft);
     color: var(--amber);
-    border-color: rgba(245, 158, 11, 0.28);
+    border-color: rgba(217, 119, 6, 0.28);
   }
   button.pause:hover:not(:disabled) { filter: brightness(1.05); background: var(--amber-soft); }
   button.danger {
@@ -745,145 +854,259 @@ PAGE = """<!DOCTYPE html>
     background: var(--btn-bg);
     color: var(--text);
   }
-  .sections {
+  .section-title {
+    margin: 0 0 12px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+
+  /* Last 5 days panels */
+  .five-days {
     display: grid;
-    grid-template-columns: 1.35fr 1fr;
-    gap: 18px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
   }
-  @media (max-width: 680px) {
-    body { padding: 16px 12px 32px; }
-    .grid { grid-template-columns: 1fr; }
-    .sections { grid-template-columns: 1fr; }
-    .time { font-size: 2rem; }
+  @media (max-width: 1040px) {
+    .five-days { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   }
-  .panel {
+  @media (max-width: 700px) {
+    .five-days { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 480px) {
+    body { padding: 14px 10px 32px; }
+    .five-days { grid-template-columns: 1fr; }
+  }
+  .day-panel {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    min-height: 210px;
   }
-  .section-head {
+  .day-panel.today {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent-soft);
+  }
+  .day-panel-head {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: 6px;
+    background: var(--surface);
   }
-  .section-head h3 {
+  .day-title {
+    font-size: 0.88rem;
+    font-weight: 700;
     margin: 0;
-    font-size: 0.82rem;
+  }
+  .day-iso {
+    font-size: 0.74rem;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .today-pill {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .day-panel-body {
+    flex: 1;
+    padding: 8px 10px;
+  }
+  .tt-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.83rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .tt-table th {
+    text-align: left;
+    font-size: 0.7rem;
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-muted);
+    padding: 4px 6px 6px;
+    border-bottom: 1px solid var(--border);
   }
-  .week-total {
-    font-size: 0.82rem;
+  .tt-table th.col-start { color: var(--green); }
+  .tt-table th.col-stop { color: var(--red); }
+  .tt-table th.col-dur, .tt-table td.col-dur { text-align: right; color: var(--text-muted); }
+  .tt-table td {
+    padding: 6px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tt-table tr:last-child td { border-bottom: 0; }
+  .t-pill {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 6px;
     font-weight: 650;
-    font-variant-numeric: tabular-nums;
-    color: var(--text);
+    font-size: 0.8rem;
   }
-  .bars {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .bar-row {
-    display: grid;
-    grid-template-columns: 62px 1fr 48px;
-    align-items: center;
-    gap: 10px;
-    font-size: 0.84rem;
-  }
-  .bar-day {
-    color: var(--text-muted);
-    font-weight: 500;
-    white-space: nowrap;
-  }
-  .bar-row.today .bar-day {
-    color: var(--text);
-    font-weight: 700;
-  }
-  .bar-track {
-    height: 10px;
-    border-radius: 999px;
-    background: var(--bar-track);
-    overflow: hidden;
-  }
-  .bar-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: var(--accent);
-    opacity: 0.72;
-    transition: width 0.25s ease;
-  }
-  .bar-row.today .bar-fill {
-    opacity: 1;
-    background: var(--green);
-  }
-  .bar-val {
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    font-weight: 600;
-    color: var(--text);
-  }
-  .bar-val.zero {
-    color: var(--text-muted);
-    font-weight: 400;
-  }
-  .events {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .event-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 7px 10px;
-    border-radius: 9px;
-    background: var(--surface-subtle);
-    border: 1px solid var(--border);
-    font-size: 0.84rem;
-  }
-  .event-time {
-    font-variant-numeric: tabular-nums;
-    font-weight: 650;
-  }
-  .event-kind {
-    font-size: 0.74rem;
-    font-weight: 650;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    padding: 2px 8px;
-    border-radius: 999px;
-    background: var(--btn-bg);
-    color: var(--text-muted);
-  }
-  .event-kind.start {
+  .t-start {
     background: var(--green-soft);
     color: var(--green);
   }
-  .event-kind.pause {
-    background: var(--amber-soft);
-    color: var(--amber);
+  .t-stop {
+    background: var(--red-soft);
+    color: var(--red);
   }
-  .empty {
-    font-size: 0.84rem;
-    color: var(--text-muted);
-    padding: 12px;
-    border-radius: 10px;
-    background: var(--surface-subtle);
-    border: 1px dashed var(--border);
+  .t-active {
+    background: var(--green-soft);
+    color: var(--green);
+    font-style: italic;
+  }
+  .empty-day {
+    padding: 22px 8px;
     text-align: center;
+    font-size: 0.8rem;
+    color: var(--text-muted);
   }
-  .card-foot {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: 8px;
-    padding-top: 12px;
+  .day-panel-foot {
+    padding: 9px 12px;
     border-top: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.82rem;
+  }
+  .foot-label {
+    color: var(--text-muted);
+    font-weight: 600;
+  }
+  .foot-total {
+    font-weight: 750;
+    font-variant-numeric: tabular-nums;
+  }
+  .foot-total.zero {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  /* Interactive Calendar section */
+  .calendar-grid-layout {
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+  @media (max-width: 820px) {
+    .calendar-grid-layout { grid-template-columns: 1fr; }
+  }
+  .cal-panel {
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .cal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .cal-month-label {
+    font-size: 0.98rem;
+    font-weight: 700;
+    margin: 0;
+  }
+  .cal-nav {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .cal-nav button {
+    padding: 5px 10px;
+    font-size: 0.8rem;
+  }
+  .cal-weekdays {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .cal-weekday {
+    text-align: center;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 4px 0;
+  }
+  .cal-days {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .cal-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 52px;
+    padding: 5px 4px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    gap: 3px;
+  }
+  .cal-cell:hover {
+    border-color: var(--accent);
+    background: var(--surface);
+  }
+  .cal-cell.blank {
+    background: transparent;
+    border: 0;
+    cursor: default;
+    pointer-events: none;
+  }
+  .cal-cell.is-today {
+    border-color: var(--accent);
+  }
+  .cal-cell.selected {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .cal-day-num {
+    font-size: 0.86rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+  }
+  .cal-day-meta {
+    font-size: 0.68rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    color: var(--green);
+    line-height: 1;
+  }
+  .cal-day-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: transparent;
+  }
+  .cal-cell.has-work .cal-day-dot {
+    background: var(--green);
+  }
+  .cal-detail .day-panel {
+    min-height: 280px;
   }
   .status-banner {
     padding: 16px 18px;
@@ -899,7 +1122,7 @@ PAGE = """<!DOCTYPE html>
   <header class="topbar">
     <div>
       <h1>Work Timer</h1>
-      <p class="subtitle">Today's lines stay in the add-on while completed intervals are saved to your Home Assistant calendar. Clearing here only drops add-on or panel lines.</p>
+      <p class="subtitle">Last 5 days of work sessions and full calendar history. Start times are shown in green and stop times in red.</p>
     </div>
     <div class="topbar-meta">
       <span id="synced">Syncing…</span>
@@ -911,12 +1134,8 @@ PAGE = """<!DOCTYPE html>
 <script>
 let currentUsers = [];
 let serverOffsetSec = 0;
-
-function parseHHMM(text) {
-  const parts = String(text || "00:00").split(":");
-  if (parts.length !== 2) return 0;
-  return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60;
-}
+let serverToday = "";
+const calState = {};
 
 function fmtHMS(totalSec) {
   const s = Math.max(0, Math.floor(totalSec));
@@ -926,16 +1145,36 @@ function fmtHMS(totalSec) {
   return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
 }
 
-function fmtHM(totalSec) {
+function fmtHoursMins(totalSec) {
   const m = Math.max(0, Math.floor(totalSec / 60));
-  return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return h + "h " + String(rem).padStart(2, "0") + "m";
 }
 
-function fmtDayLabel(iso, isToday) {
-  if (isToday) return "Today";
+function fmtCompactHM(totalSec) {
+  const m = Math.max(0, Math.floor(totalSec / 60));
+  if (m <= 0) return "";
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return h > 0 ? (h + "h" + (rem ? " " + rem + "m" : "")) : (rem + "m");
+}
+
+function fmtShortDate(iso) {
   const d = new Date(iso + "T00:00:00");
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric" });
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
+function fmtFullDate(iso) {
+  const d = new Date(iso + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric", year: "numeric" });
+}
+
+function fmtMonthYear(year, month) {
+  const d = new Date(year, month - 1, 1);
+  return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
 function liveSeconds(user) {
@@ -945,6 +1184,35 @@ function liveSeconds(user) {
     total += Math.max(0, nowSec - user.segment_start);
   }
   return total;
+}
+
+function liveRunningSegmentSeconds(user) {
+  if (!user.running || typeof user.segment_start !== "number") return 0;
+  const nowSec = Math.floor(Date.now() / 1000) + serverOffsetSec;
+  return Math.max(0, nowSec - user.segment_start);
+}
+
+function effectiveDayTotalSeconds(dayData, user) {
+  let total = 0;
+  for (const iv of (dayData && dayData.intervals) || []) {
+    total += iv.running && user ? liveRunningSegmentSeconds(user) : Number(iv.seconds || 0);
+  }
+  return total;
+}
+
+function getCalState(userName) {
+  if (!calState[userName]) {
+    const base = serverToday ? new Date(serverToday + "T00:00:00") : new Date();
+    calState[userName] = {
+      year: base.getFullYear(),
+      month: base.getMonth() + 1,
+      selectedDate: serverToday || base.toISOString().slice(0, 10),
+      days: null,
+      loading: false,
+      loadedKey: ""
+    };
+  }
+  return calState[userName];
 }
 
 async function sendCommand(userName, command, button) {
@@ -959,13 +1227,276 @@ async function sendCommand(userName, command, button) {
       body: JSON.stringify({user: userName, command})
     });
   } finally {
+    const st = getCalState(userName);
+    st.loadedKey = "";
     await load();
   }
 }
 
+async function loadCalendarMonth(userName, force) {
+  const st = getCalState(userName);
+  const key = st.year + "-" + st.month;
+  if (!force && st.loadedKey === key && st.days) {
+    renderCalendarArea(userName);
+    return;
+  }
+  st.loading = true;
+  renderCalendarArea(userName);
+  try {
+    const url = "api/calendar?user=" + encodeURIComponent(userName) + "&year=" + st.year + "&month=" + st.month;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (data && data.days) {
+      st.days = data.days;
+      st.loadedKey = key;
+    }
+  } catch (err) {
+    // Keep existing view if offline
+  } finally {
+    st.loading = false;
+    renderCalendarArea(userName);
+  }
+}
+
+function buildDayPanel(dayData, user, options) {
+  const opts = options || {};
+  const iso = dayData.date;
+  const isToday = iso === serverToday;
+  const panel = document.createElement("div");
+  panel.className = "day-panel" + (isToday ? " today" : "");
+
+  // Date header on top
+  const head = document.createElement("div");
+  head.className = "day-panel-head";
+  const headText = document.createElement("div");
+  const title = document.createElement("div");
+  title.className = "day-title";
+  title.textContent = opts.fullDate ? fmtFullDate(iso) : fmtShortDate(iso);
+  const sub = document.createElement("div");
+  sub.className = "day-iso";
+  sub.textContent = iso;
+  headText.append(title, sub);
+  head.appendChild(headText);
+  if (isToday) {
+    const pill = document.createElement("span");
+    pill.className = "today-pill";
+    pill.textContent = "Today";
+    head.appendChild(pill);
+  }
+
+  // Timetable underneath
+  const body = document.createElement("div");
+  body.className = "day-panel-body";
+  const intervals = dayData.intervals || [];
+  if (!intervals.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-day";
+    empty.textContent = "No sessions";
+    body.appendChild(empty);
+  } else {
+    const table = document.createElement("table");
+    table.className = "tt-table";
+    const thead = document.createElement("thead");
+    const hrow = document.createElement("tr");
+    const thStart = document.createElement("th");
+    thStart.className = "col-start";
+    thStart.textContent = "Start";
+    const thStop = document.createElement("th");
+    thStop.className = "col-stop";
+    thStop.textContent = "Stop";
+    hrow.append(thStart, thStop);
+    if (opts.showDuration) {
+      const thDur = document.createElement("th");
+      thDur.className = "col-dur";
+      thDur.textContent = "Duration";
+      hrow.appendChild(thDur);
+    }
+    thead.appendChild(hrow);
+
+    const tbody = document.createElement("tbody");
+    for (const iv of intervals) {
+      const tr = document.createElement("tr");
+      const tdStart = document.createElement("td");
+      const spStart = document.createElement("span");
+      spStart.className = "t-pill t-start";
+      spStart.textContent = iv.start || "--:--";
+      tdStart.appendChild(spStart);
+
+      const tdStop = document.createElement("td");
+      const spStop = document.createElement("span");
+      if (iv.running) {
+        spStop.className = "t-pill t-active";
+        spStop.textContent = "Running";
+      } else {
+        spStop.className = "t-pill t-stop";
+        spStop.textContent = iv.end || "--:--";
+      }
+      tdStop.appendChild(spStop);
+      tr.append(tdStart, tdStop);
+
+      if (opts.showDuration) {
+        const tdDur = document.createElement("td");
+        tdDur.className = "col-dur";
+        const secs = iv.running && user ? liveRunningSegmentSeconds(user) : Number(iv.seconds || 0);
+        tdDur.textContent = fmtHoursMins(secs);
+        tr.appendChild(tdDur);
+      }
+      tbody.appendChild(tr);
+    }
+    table.append(thead, tbody);
+    body.appendChild(table);
+  }
+
+  // Total hours & minutes footer underneath timetable
+  const foot = document.createElement("div");
+  foot.className = "day-panel-foot";
+  const footLbl = document.createElement("span");
+  footLbl.className = "foot-label";
+  footLbl.textContent = "Total";
+  const totalSec = effectiveDayTotalSeconds(dayData, user);
+  const footVal = document.createElement("span");
+  footVal.className = "foot-total" + (totalSec <= 0 ? " zero" : "");
+  footVal.textContent = fmtHoursMins(totalSec);
+  if (isToday && user) {
+    footVal.dataset.dayTotal = user.name;
+  }
+  foot.append(footLbl, footVal);
+
+  panel.append(head, body, foot);
+  return panel;
+}
+
+function renderCalendarArea(userName) {
+  const container = document.querySelector('[data-cal-area="' + CSS.escape(userName) + '"]');
+  if (!container) return;
+  const user = currentUsers.find((u) => u.name === userName);
+  const st = getCalState(userName);
+
+  container.innerHTML = "";
+
+  // Left: Month calendar
+  const calPanel = document.createElement("div");
+  calPanel.className = "cal-panel";
+
+  const calHead = document.createElement("div");
+  calHead.className = "cal-header";
+  const monthLabel = document.createElement("h4");
+  monthLabel.className = "cal-month-label";
+  monthLabel.textContent = fmtMonthYear(st.year, st.month);
+
+  const nav = document.createElement("div");
+  nav.className = "cal-nav";
+  const prevBtn = document.createElement("button");
+  prevBtn.type = "button";
+  prevBtn.className = "ghost";
+  prevBtn.textContent = "‹ Prev";
+  prevBtn.addEventListener("click", () => {
+    st.month -= 1;
+    if (st.month < 1) { st.month = 12; st.year -= 1; }
+    loadCalendarMonth(userName, true);
+  });
+
+  const todayBtn = document.createElement("button");
+  todayBtn.type = "button";
+  todayBtn.className = "ghost";
+  todayBtn.textContent = "Today";
+  todayBtn.addEventListener("click", () => {
+    const base = serverToday ? new Date(serverToday + "T00:00:00") : new Date();
+    st.year = base.getFullYear();
+    st.month = base.getMonth() + 1;
+    st.selectedDate = serverToday || base.toISOString().slice(0, 10);
+    loadCalendarMonth(userName, true);
+  });
+
+  const nextBtn = document.createElement("button");
+  nextBtn.type = "button";
+  nextBtn.className = "ghost";
+  nextBtn.textContent = "Next ›";
+  nextBtn.addEventListener("click", () => {
+    st.month += 1;
+    if (st.month > 12) { st.month = 1; st.year += 1; }
+    loadCalendarMonth(userName, true);
+  });
+
+  nav.append(prevBtn, todayBtn, nextBtn);
+  calHead.append(monthLabel, nav);
+
+  const weekdays = document.createElement("div");
+  weekdays.className = "cal-weekdays";
+  for (const wd of ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]) {
+    const el = document.createElement("div");
+    el.className = "cal-weekday";
+    el.textContent = wd;
+    weekdays.appendChild(el);
+  }
+
+  const daysGrid = document.createElement("div");
+  daysGrid.className = "cal-days";
+  const firstDay = new Date(st.year, st.month - 1, 1);
+  const startOffset = (firstDay.getDay() + 6) % 7; // Monday = 0
+  const daysInMonth = new Date(st.year, st.month, 0).getDate();
+
+  for (let i = 0; i < startOffset; i++) {
+    const blank = document.createElement("div");
+    blank.className = "cal-cell blank";
+    daysGrid.appendChild(blank);
+  }
+
+  for (let dayNum = 1; dayNum <= daysInMonth; dayNum++) {
+    const iso = st.year + "-" + String(st.month).padStart(2, "0") + "-" + String(dayNum).padStart(2, "0");
+    const dayObj = st.days && st.days[iso] ? st.days[iso] : { date: iso, intervals: [], total_seconds: 0 };
+    const totalSec = effectiveDayTotalSeconds(dayObj, user);
+    const hasWork = (dayObj.intervals && dayObj.intervals.length > 0) || totalSec > 0;
+
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "cal-cell"
+      + (iso === serverToday ? " is-today" : "")
+      + (iso === st.selectedDate ? " selected" : "")
+      + (hasWork ? " has-work" : "");
+    cell.addEventListener("click", () => {
+      st.selectedDate = iso;
+      renderCalendarArea(userName);
+    });
+
+    const num = document.createElement("span");
+    num.className = "cal-day-num";
+    num.textContent = String(dayNum);
+
+    if (hasWork) {
+      const meta = document.createElement("span");
+      meta.className = "cal-day-meta";
+      meta.textContent = fmtCompactHM(totalSec) || "•";
+      cell.append(num, meta);
+    } else {
+      const dot = document.createElement("span");
+      dot.className = "cal-day-dot";
+      cell.append(num, dot);
+    }
+    daysGrid.appendChild(cell);
+  }
+
+  calPanel.append(calHead, weekdays, daysGrid);
+
+  // Right: Selected day timetable
+  const detailWrap = document.createElement("div");
+  detailWrap.className = "cal-detail";
+  const selectedIso = st.selectedDate;
+  let selectedDay = (st.days && st.days[selectedIso]) || null;
+  if (!selectedDay && user && user.recent_days) {
+    selectedDay = user.recent_days.find((d) => d.date === selectedIso) || null;
+  }
+  if (!selectedDay) {
+    selectedDay = { date: selectedIso, intervals: [], total_seconds: 0 };
+  }
+  detailWrap.appendChild(buildDayPanel(selectedDay, user, { fullDate: true, showDuration: true }));
+
+  container.append(calPanel, detailWrap);
+}
+
 function render(users) {
   const root = document.getElementById("users");
-  root.className = users.length <= 1 ? "grid single" : "grid";
+  root.className = "users-stack";
   root.innerHTML = "";
   if (!users.length) {
     root.className = "status-banner";
@@ -976,11 +1507,12 @@ function render(users) {
   for (const user of users) {
     const card = document.createElement("article");
     card.className = "card";
-    card.dataset.user = user.name;
 
     // Header
     const head = document.createElement("div");
     head.className = "card-head";
+    const headLeft = document.createElement("div");
+    headLeft.className = "head-left";
     const title = document.createElement("h2");
     title.className = "user-name";
     title.textContent = user.name;
@@ -989,15 +1521,31 @@ function render(users) {
     const dot = document.createElement("span");
     dot.className = "dot";
     badge.append(dot, document.createTextNode(user.running ? "Running" : "Stopped"));
-    head.append(title, badge);
+    headLeft.append(title, badge);
 
-    // Hero timer & primary controls
+    const headTools = document.createElement("div");
+    headTools.className = "actions";
+    const clearPanelBtn = document.createElement("button");
+    clearPanelBtn.type = "button";
+    clearPanelBtn.className = "ghost";
+    clearPanelBtn.textContent = "Clear panel screen";
+    clearPanelBtn.addEventListener("click", () => sendCommand(user.name, "clear", clearPanelBtn));
+
+    const clearAddonBtn = document.createElement("button");
+    clearAddonBtn.type = "button";
+    clearAddonBtn.className = "ghost";
+    clearAddonBtn.textContent = "Clear add-on timestamps";
+    clearAddonBtn.addEventListener("click", () => sendCommand(user.name, "clear_addon", clearAddonBtn));
+    headTools.append(clearPanelBtn, clearAddonBtn);
+    head.append(headLeft, headTools);
+
+    // Live timer + controls
     const hero = document.createElement("div");
     hero.className = "hero";
     const timerBox = document.createElement("div");
     const timerLabel = document.createElement("p");
     timerLabel.className = "timer-label";
-    timerLabel.textContent = "Today's total";
+    timerLabel.textContent = "Today's timer";
     const timeEl = document.createElement("p");
     timeEl.className = "time";
     timeEl.dataset.timer = user.name;
@@ -1010,7 +1558,7 @@ function render(users) {
     const toggleBtn = document.createElement("button");
     toggleBtn.type = "button";
     toggleBtn.className = user.running ? "pause" : "primary";
-    toggleBtn.textContent = user.running ? "Pause" : "Start";
+    toggleBtn.textContent = user.running ? "Stop / Pause" : "Start";
     toggleBtn.addEventListener("click", () => sendCommand(user.name, user.running ? "pause" : "start", toggleBtn));
 
     const resetBtn = document.createElement("button");
@@ -1019,121 +1567,35 @@ function render(users) {
     resetBtn.textContent = "Reset";
     resetBtn.disabled = !user.running && secNow <= 0;
     resetBtn.addEventListener("click", () => sendCommand(user.name, "reset", resetBtn));
-
     actions.append(toggleBtn, resetBtn);
     hero.append(timerBox, actions);
 
-    // Two-column body: 7-day bars + today's events
-    const sections = document.createElement("div");
-    sections.className = "sections";
-
-    // Left: 7-day chart
-    const weekPanel = document.createElement("section");
-    weekPanel.className = "panel";
-    const days = user.days || [];
-    const daySecs = days.map((d, idx) => idx === days.length - 1 ? secNow : parseHHMM(d.total));
-    const maxSec = Math.max(3600, ...daySecs);
-    const weekSum = daySecs.reduce((acc, v) => acc + v, 0);
-
-    const weekHead = document.createElement("div");
-    weekHead.className = "section-head";
-    const weekTitle = document.createElement("h3");
-    weekTitle.textContent = "Last 7 days";
-    const weekTotal = document.createElement("span");
-    weekTotal.className = "week-total";
-    weekTotal.textContent = "Total " + fmtHM(weekSum);
-    weekHead.append(weekTitle, weekTotal);
-
-    const bars = document.createElement("div");
-    bars.className = "bars";
-    if (!days.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = "No calendar entries";
-      bars.appendChild(empty);
-    } else {
-      days.forEach((day, idx) => {
-        const isToday = idx === days.length - 1;
-        const valSec = daySecs[idx];
-        const row = document.createElement("div");
-        row.className = "bar-row" + (isToday ? " today" : "");
-        row.title = day.date + " — " + fmtHM(valSec);
-
-        const dayLbl = document.createElement("span");
-        dayLbl.className = "bar-day";
-        dayLbl.textContent = fmtDayLabel(day.date, isToday);
-
-        const track = document.createElement("div");
-        track.className = "bar-track";
-        const fill = document.createElement("div");
-        fill.className = "bar-fill";
-        fill.style.width = (valSec > 0 ? Math.max(4, Math.round((valSec / maxSec) * 100)) : 0) + "%";
-        track.appendChild(fill);
-
-        const valLbl = document.createElement("span");
-        valLbl.className = "bar-val" + (valSec <= 0 ? " zero" : "");
-        valLbl.textContent = fmtHM(valSec);
-
-        row.append(dayLbl, track, valLbl);
-        bars.appendChild(row);
-      });
+    // Last 5 days section (separate panel per day)
+    const fiveSection = document.createElement("section");
+    const fiveHeading = document.createElement("h3");
+    fiveHeading.className = "section-title";
+    fiveHeading.textContent = "Last 5 days";
+    const fiveGrid = document.createElement("div");
+    fiveGrid.className = "five-days";
+    for (const dayData of user.recent_days || []) {
+      fiveGrid.appendChild(buildDayPanel(dayData, user, { fullDate: false, showDuration: false }));
     }
-    weekPanel.append(weekHead, bars);
+    fiveSection.append(fiveHeading, fiveGrid);
 
-    // Right: Today's activity log
-    const todayPanel = document.createElement("section");
-    todayPanel.className = "panel";
-    const todayHead = document.createElement("div");
-    todayHead.className = "section-head";
-    const todayTitle = document.createElement("h3");
-    todayTitle.textContent = "Today's activity";
-    todayHead.appendChild(todayTitle);
+    // Calendar section underneath
+    const calSection = document.createElement("section");
+    const calHeading = document.createElement("h3");
+    calHeading.className = "section-title";
+    calHeading.textContent = "Calendar";
+    const calArea = document.createElement("div");
+    calArea.className = "calendar-grid-layout";
+    calArea.dataset.calArea = user.name;
+    calSection.append(calHeading, calArea);
 
-    const events = user.events || [];
-    if (!events.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = "No timestamps yet";
-      todayPanel.append(todayHead, empty);
-    } else {
-      const list = document.createElement("ul");
-      list.className = "events";
-      for (const ev of [...events].reverse()) {
-        const item = document.createElement("li");
-        item.className = "event-item";
-        const t = document.createElement("span");
-        t.className = "event-time";
-        t.textContent = ev.t || "--:--";
-        const k = document.createElement("span");
-        const kind = String(ev.kind || "").toLowerCase();
-        k.className = "event-kind " + (kind === "start" || kind === "pause" ? kind : "");
-        k.textContent = ev.kind || "";
-        item.append(t, k);
-        list.appendChild(item);
-      }
-      todayPanel.append(todayHead, list);
-    }
-
-    sections.append(weekPanel, todayPanel);
-
-    // Footer utility buttons
-    const foot = document.createElement("div");
-    foot.className = "card-foot";
-    const clearPanelBtn = document.createElement("button");
-    clearPanelBtn.type = "button";
-    clearPanelBtn.className = "ghost";
-    clearPanelBtn.textContent = "Clear panel screen";
-    clearPanelBtn.addEventListener("click", () => sendCommand(user.name, "clear", clearPanelBtn));
-
-    const clearAddonBtn = document.createElement("button");
-    clearAddonBtn.type = "button";
-    clearAddonBtn.className = "ghost";
-    clearAddonBtn.textContent = "Clear add-on timestamps";
-    clearAddonBtn.addEventListener("click", () => sendCommand(user.name, "clear_addon", clearAddonBtn));
-
-    foot.append(clearPanelBtn, clearAddonBtn);
-    card.append(head, hero, sections, foot);
+    card.append(head, hero, fiveSection, calSection);
     root.appendChild(card);
+
+    loadCalendarMonth(user.name, false);
   }
 }
 
@@ -1142,6 +1604,13 @@ function tick() {
     if (!user.running) continue;
     const el = document.querySelector('[data-timer="' + CSS.escape(user.name) + '"]');
     if (el) el.textContent = fmtHMS(liveSeconds(user));
+    const todayData = (user.recent_days || []).find((d) => d.date === serverToday);
+    if (todayData) {
+      const liveTot = fmtHoursMins(effectiveDayTotalSeconds(todayData, user));
+      document.querySelectorAll('[data-day-total="' + CSS.escape(user.name) + '"]').forEach((node) => {
+        node.textContent = liveTot;
+      });
+    }
   }
 }
 
@@ -1165,12 +1634,20 @@ async function load() {
   if (typeof data.server_now === "number") {
     serverOffsetSec = data.server_now - Math.floor(Date.now() / 1000);
   }
+  if (data.today) {
+    serverToday = data.today;
+  }
   currentUsers = data.users || [];
   render(currentUsers);
   synced.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-document.getElementById("refreshBtn").addEventListener("click", load);
+document.getElementById("refreshBtn").addEventListener("click", () => {
+  for (const key of Object.keys(calState)) {
+    calState[key].loadedKey = "";
+  }
+  load();
+});
 load();
 setInterval(load, 15000);
 setInterval(tick, 1000);
@@ -1245,6 +1722,28 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
                     return
                 try:
                     self._send(200, app.snapshot())
+                except (OSError, RuntimeError) as err:
+                    self._send(502, {"error": str(err)})
+                return
+            if path == "/api/calendar":
+                if not (self._ingress() or self._authorized()):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                query = parse_qs(urlparse(self.path).query)
+                name = (query.get("user") or ["panel"])[0]
+                now = app._now()
+                try:
+                    year = int((query.get("year") or [str(now.year)])[0])
+                    month = int((query.get("month") or [str(now.month)])[0])
+                except ValueError:
+                    self._send(400, {"error": "invalid year or month"})
+                    return
+                try:
+                    self._send(200, app.month_calendar(name, year, month))
+                except KeyError:
+                    self._send(404, {"error": f"no user {name}"})
+                except ValueError as err:
+                    self._send(400, {"error": str(err)})
                 except (OSError, RuntimeError) as err:
                     self._send(502, {"error": str(err)})
                 return
