@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+
+- A pause from the panel stays paused. An older running update no longer starts the timer again.
+
 ## 0.1.8
 
 - A timer started in the add-on stays running when the panel syncs, and the panel follows it.

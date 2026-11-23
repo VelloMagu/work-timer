@@ -162,26 +162,30 @@ def apply_command(user: dict[str, Any], command: str, now_epoch: int, when: str)
 
 
 def merge_users(server: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
-    """Keep a running timer. A sync from a stopped side is not a pause."""
+    """A routine sync must not undo a newer start or pause."""
     server_at = int(server.get("updated_at") or 0)
     client_at = int(client.get("updated_at") or 0)
     server_running = bool(server.get("running"))
     client_running = bool(client.get("running"))
-    if server_running != client_running:
-        result = deepcopy(server if server_running else client)
-        result["running"] = True
+
+    def finish(source: dict[str, Any], running: bool) -> dict[str, Any]:
+        result = deepcopy(source)
+        result["running"] = running
         result["events"] = list(server.get("events") or [])
         result["display_cleared_at"] = int(server.get("display_cleared_at") or 0)
-        if server_running:
-            result["segment_start"] = server.get("segment_start")
-            result["elapsed_seconds"] = int(server.get("elapsed_seconds") or 0)
+        if not running:
+            result["segment_start"] = None
         return result
+
+    if server_running != client_running:
+        if server_at >= client_at:
+            return finish(server, server_running)
+        return finish(client, client_running)
     newer = client if client_at > server_at else server
     result = deepcopy(newer)
     result["events"] = list(server.get("events") or [])
     result["display_cleared_at"] = int(server.get("display_cleared_at") or 0)
-    both_running = server_running and client_running
-    if not both_running:
+    if not (server_running and client_running):
         return result
     starts = [
         int(item["segment_start"])
