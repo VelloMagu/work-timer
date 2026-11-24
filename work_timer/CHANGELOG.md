@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.17
+
+- Add an add-on store icon and logo.
+
+
 ## 0.1.16
 
 - Security: trust the ingress header only from the Supervisor gateway. Before, any LAN client could send it and skip the token. Compare the token in constant time and cap request bodies.
