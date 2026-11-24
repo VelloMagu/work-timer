@@ -1,7 +1,7 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-RUN apk add --no-cache python3
+RUN apk add --no-cache python3 tzdata
 
 COPY timer.py /timer.py
 COPY run.sh /run.sh

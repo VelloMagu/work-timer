@@ -1,16 +1,16 @@
 name: Work Timer
-version: 0.1.15
+version: 0.1.16
 slug: work_timer
 description: Keeps a work timer for one or more users and writes completed intervals to a Home Assistant calendar.
 url: https://github.com/VelloMagu/work-timer
 arch:
   - amd64
   - aarch64
-startup: services
+startup: application
+watchdog: http://[HOST]:[PORT:8097]/v1/health
 boot: auto
 init: false
 homeassistant_api: true
-hassio_api: true
 ingress: true
 ingress_port: 8097
 ports:

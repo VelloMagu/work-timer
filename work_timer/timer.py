@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 import socket
 import ssl
 import struct
 import threading
+import time
 import urllib.error
 import urllib.request
 from copy import deepcopy
@@ -24,6 +26,7 @@ DIRECTORY_PATH = Path(os.environ.get("DIRECTORY_PATH", "/data/work-timer-directo
 HA_API = os.environ.get("HA_API", "http://supervisor/core/api").rstrip("/")
 HA_WS = os.environ.get("HA_WS", "ws://supervisor/core/websocket")
 MAX_EVENTS = 6
+INGRESS_GATEWAY = os.environ.get("INGRESS_GATEWAY", "172.30.32.2")
 
 
 def load_options() -> dict[str, Any]:
@@ -278,13 +281,22 @@ def _request(
     return json.loads(raw)
 
 
-def timezone_name(token: str) -> str:
-    try:
-        config = _request("GET", "/config", token)
-    except (OSError, RuntimeError, json.JSONDecodeError):
-        return "UTC"
-    name = config.get("time_zone") if isinstance(config, dict) else None
-    return str(name or "UTC")
+def timezone_name(token: str, attempts: int = 120, delay: int = 5) -> str:
+    """Wait for Home Assistant Core and read its time zone. UTC only if it never answers."""
+    for attempt in range(attempts):
+        try:
+            config = _request("GET", "/config", token, timeout=10)
+        except (OSError, RuntimeError, json.JSONDecodeError) as err:
+            if attempt == 0:
+                print(f"waiting for Home Assistant: {err}", flush=True)
+            time.sleep(delay)
+            continue
+        name = config.get("time_zone") if isinstance(config, dict) else None
+        if name:
+            return str(name)
+        break
+    print("Home Assistant time zone unavailable, using UTC", flush=True)
+    return "UTC"
 
 
 def slug(name: str) -> str:
@@ -295,6 +307,16 @@ def slug(name: str) -> str:
 
 
 def ensure_calendar(token: str, calendar_name: str) -> str:
+    for _ in range(60):
+        try:
+            return _ensure_calendar(token, calendar_name)
+        except (OSError, RuntimeError, json.JSONDecodeError) as err:
+            print(f"calendar setup will retry: {err}", flush=True)
+            time.sleep(5)
+    return _ensure_calendar(token, calendar_name)
+
+
+def _ensure_calendar(token: str, calendar_name: str) -> str:
     states = _request("GET", "/states", token)
     wanted = calendar_name.casefold()
     if isinstance(states, list):
@@ -671,7 +693,7 @@ def daily_totals(events: list[dict[str, str]], zone: ZoneInfo, today_seconds: in
     return rows
 
 
-def load_directory(option_users: list[Any]) -> tuple[list[str], dict[str, str]]:
+def load_directory(option_users: list[Any]) -> tuple[list[str], dict[str, str], list[str]]:
     raw: dict[str, Any] = {}
     if DIRECTORY_PATH.is_file():
         try:
@@ -682,11 +704,16 @@ def load_directory(option_users: list[Any]) -> tuple[list[str], dict[str, str]]:
             raw = {}
     names: list[str] = []
     stored = raw.get("users") if isinstance(raw.get("users"), list) else []
+    removed_raw = raw.get("removed") if isinstance(raw.get("removed"), list) else []
+    removed = [str(item).strip() for item in removed_raw if str(item).strip()]
     for source in (stored, option_users):
         for item in source:
             name = str(item or "").strip()
-            if name and name not in names:
-                names.append(name)
+            if not name or name in names:
+                continue
+            if source is option_users and name in removed:
+                continue
+            names.append(name)
     if not names:
         names = ["panel"]
     people: dict[str, str] = {}
@@ -696,13 +723,13 @@ def load_directory(option_users: list[Any]) -> tuple[list[str], dict[str, str]]:
         user_name = str(user or "").strip()
         if person_id.startswith("person.") and user_name in names:
             people[person_id] = user_name
-    return names, people
+    return names, people, removed
 
 
-def save_directory(names: list[str], people: dict[str, str]) -> None:
+def save_directory(names: list[str], people: dict[str, str], removed: list[str] | None = None) -> None:
     DIRECTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     DIRECTORY_PATH.write_text(
-        json.dumps({"users": names, "people": people}, indent=2),
+        json.dumps({"users": names, "people": people, "removed": removed or []}, indent=2),
         encoding="utf-8",
     )
 
@@ -736,9 +763,9 @@ class TimerApp:
         self.calendar_entity = calendar_entity
         self.zone = zone
         self.ha_token = ha_token
-        self.user_names, self.people = load_directory(list(options.get("users") or []))
+        self.user_names, self.people, self.removed = load_directory(list(options.get("users") or []))
         self.users = set(self.user_names)
-        save_directory(self.user_names, self.people)
+        save_directory(self.user_names, self.people, self.removed)
         self.store = Store(STATE_PATH)
         self.token = str(options.get("token") or "").strip()
 
@@ -898,7 +925,7 @@ class TimerApp:
 
     def _remember(self) -> None:
         self.users = set(self.user_names)
-        save_directory(self.user_names, self.people)
+        save_directory(self.user_names, self.people, self.removed)
 
     def _directory_locked(self) -> dict[str, Any]:
         now_epoch = int(self._now().timestamp())
@@ -928,6 +955,8 @@ class TimerApp:
         if not cleaned or len(cleaned) > 40:
             raise ValueError("enter a user name")
         with self.store.lock:
+            if cleaned in self.removed:
+                self.removed.remove(cleaned)
             if cleaned not in self.user_names:
                 self.user_names.append(cleaned)
                 self._user(cleaned)
@@ -941,7 +970,10 @@ class TimerApp:
             if len(self.user_names) == 1:
                 raise ValueError("keep at least one user")
             self.user_names.remove(name)
+            if name not in self.removed:
+                self.removed.append(name)
             self.store.users.pop(name, None)
+            self.store.save()
             self.people = {person: user for person, user in self.people.items() if user != name}
             self._remember()
             return self._directory_locked()
@@ -2390,17 +2422,23 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(raw)
 
         def _ingress(self) -> bool:
+            # Only the Supervisor ingress gateway may use this header. Port 8097 is
+            # published, so any other client could otherwise send it itself.
+            if self.client_address[0] != INGRESS_GATEWAY:
+                return False
             return bool(self.headers.get("X-Ingress-Path"))
 
         def _authorized(self) -> bool:
             if not token:
                 return False
             header = self.headers.get("Authorization", "")
-            return header == f"Bearer {token}"
+            return hmac.compare_digest(header.encode(), f"Bearer {token}".encode())
 
         def _read_json(self) -> dict[str, Any] | None:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+                if length < 0 or length > 1_000_000:
+                    return None
                 payload = json.loads(self.rfile.read(length).decode() or "{}")
             except (ValueError, json.JSONDecodeError):
                 return None
@@ -2408,6 +2446,9 @@ def make_handler(app: TimerApp, token: str) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
+            if path == "/v1/health":
+                self._send(200, {"ok": True})
+                return
             if path in ("/", "/index.html"):
                 if not (self._ingress() or self._authorized()):
                     self._send(401, {"error": "unauthorized"})

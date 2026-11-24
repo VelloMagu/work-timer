@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.16
+
+- Security: trust the ingress header only from the Supervisor gateway. Before, any LAN client could send it and skip the token. Compare the token in constant time and cap request bodies.
+- Start after Home Assistant Core and wait for it, so the time zone is no longer lost to a UTC fallback after a boot. Retry the calendar setup.
+- Users removed in the sidebar stay removed after a restart. Adding the name again brings it back.
+- Add a watchdog on `/v1/health`, install `tzdata` in the image, and drop the unused `hassio_api`.
+
 ## 0.1.15
 
 - Show the Work Timer sidebar panel to every user, including non-admins.
