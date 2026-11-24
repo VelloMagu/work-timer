@@ -1,5 +1,5 @@
 name: Work Timer
-version: 0.1.14
+version: 0.1.15
 slug: work_timer
 description: Keeps a work timer for one or more users and writes completed intervals to a Home Assistant calendar.
 url: https://github.com/VelloMagu/work-timer
@@ -17,6 +17,7 @@ ports:
   8097/tcp: 8097
 panel_icon: mdi:timer-outline
 panel_title: Work Timer
+panel_admin: false
 options:
   calendar_name: ""
   token: ""

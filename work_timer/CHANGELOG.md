@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.15
+
+- Show the Work Timer sidebar panel to every user, including non-admins.
+
 ## 0.1.14
 
 - Add, remove, and assign timer users, including a default user for each Home Assistant person.
